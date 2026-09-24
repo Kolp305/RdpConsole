@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
@@ -14,6 +15,28 @@ using System.Windows.Forms;
 
 namespace RdpConsole
 {
+    // Спільні константи й форматування для глобальної гарячої клавіші -- використовуються
+    // і в налаштуваннях за замовчуванням (AppSettings), і в реєстрації (MainForm),
+    // і в діалозі вибору комбінації (SettingsForm), щоб не дублювати значення.
+    public static class HotkeyUtil
+    {
+        public const uint MOD_ALT = 0x0001;
+        public const uint MOD_CONTROL = 0x0002;
+        public const uint MOD_SHIFT = 0x0004;
+        public const uint DefaultVk = 0x52; // VK_R
+
+        public static string Format(uint modifiers, uint vk)
+        {
+            if (vk == 0) return "(не задано)";
+            var sb = new StringBuilder();
+            if ((modifiers & MOD_CONTROL) != 0) sb.Append("Ctrl+");
+            if ((modifiers & MOD_ALT) != 0) sb.Append("Alt+");
+            if ((modifiers & MOD_SHIFT) != 0) sb.Append("Shift+");
+            sb.Append(((Keys)vk).ToString());
+            return sb.ToString();
+        }
+    }
+
     [DataContract]
     public class AppSettings
     {
@@ -23,6 +46,8 @@ namespace RdpConsole
         [DataMember] public Dictionary<string, string> EncryptedPasswords { get; set; }
         [DataMember] public string DefaultEncryptedPassword { get; set; }
         [DataMember] public bool HierarchyView { get; set; }
+        [DataMember] public uint HotkeyModifiers { get; set; }
+        [DataMember] public uint HotkeyKey { get; set; }
 
         public static AppSettings CreateDefault()
         {
@@ -32,7 +57,9 @@ namespace RdpConsole
                 WindowWidth = 940,
                 WindowHeight = 620,
                 EncryptedPasswords = new Dictionary<string, string>(),
-                HierarchyView = true
+                HierarchyView = true,
+                HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT,
+                HotkeyKey = HotkeyUtil.DefaultVk
             };
         }
     }
@@ -60,6 +87,13 @@ namespace RdpConsole
                         var ser = new DataContractJsonSerializer(typeof(AppSettings));
                         var s = (AppSettings)ser.ReadObject(fs);
                         if (s.EncryptedPasswords == null) s.EncryptedPasswords = new Dictionary<string, string>();
+                        // Старі файли налаштувань (до появи цієї функції) не мають цих полів --
+                        // після десеріалізації вони будуть 0, повертаємо типову комбінацію.
+                        if (s.HotkeyKey == 0)
+                        {
+                            s.HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
+                            s.HotkeyKey = HotkeyUtil.DefaultVk;
+                        }
                         return s;
                     }
                 }
@@ -349,15 +383,78 @@ namespace RdpConsole
         }
     }
 
+    // Перевірка й встановлення оновлень з GitHub -- за тим самим принципом, що й
+    // ShadowSessionTool: version.txt у репозиторії звіряється з поточною версією,
+    // завантажується готовий .exe з останнього релізу і підміняє поточний файл.
+    public static class UpdateChecker
+    {
+        public const string VersionUrl = "https://raw.githubusercontent.com/Kolp305/RdpConsole/master/version.txt";
+        public const string DownloadUrl = "https://github.com/Kolp305/RdpConsole/releases/latest/download/RdpConsole.exe";
+
+        static UpdateChecker()
+        {
+            try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
+        }
+
+        public static bool IsNewer(string remoteVersion, string currentVersion)
+        {
+            if (string.IsNullOrWhiteSpace(remoteVersion)) return false;
+            Version rv, cv;
+            if (!Version.TryParse(Normalize(remoteVersion), out rv)) return false;
+            if (!Version.TryParse(Normalize(currentVersion), out cv)) return false;
+            return rv > cv;
+        }
+
+        static string Normalize(string v)
+        {
+            return v.Trim().TrimStart('v', 'V');
+        }
+
+        // Готує й запускає службовий .bat, що дочекається завершення поточного процесу
+        // (файл .exe не можна перезаписати, поки він запущений), підмінить його щойно
+        // завантаженою версією і перезапустить застосунок. Викликати одразу перед виходом.
+        public static void PrepareUpdateBatch(string newExePath)
+        {
+            var currentExe = Application.ExecutablePath;
+            var pid = Process.GetCurrentProcess().Id;
+            var batchPath = Path.Combine(Path.GetTempPath(), "RdpConsole_update_" + pid + ".bat");
+
+            var script =
+                "@echo off\r\n" +
+                ":wait\r\n" +
+                "tasklist /fi \"PID eq " + pid + "\" 2>nul | find \"" + pid + "\" >nul\r\n" +
+                "if not errorlevel 1 (\r\n" +
+                "  timeout /t 1 /nobreak >nul\r\n" +
+                "  goto wait\r\n" +
+                ")\r\n" +
+                "copy /y \"" + newExePath + "\" \"" + currentExe + "\" >nul\r\n" +
+                "del \"" + newExePath + "\" >nul\r\n" +
+                "start \"\" \"" + currentExe + "\"\r\n" +
+                "del \"%~f0\"\r\n";
+
+            File.WriteAllText(batchPath, script, Encoding.ASCII);
+
+            var psi = new ProcessStartInfo("cmd.exe", "/c \"" + batchPath + "\"")
+            {
+                WindowStyle = ProcessWindowStyle.Hidden,
+                CreateNoWindow = true,
+                UseShellExecute = false
+            };
+            Process.Start(psi);
+        }
+    }
+
     public class MainForm : Form
     {
         AppSettings settings;
         List<RdpEntry> allEntries = new List<RdpEntry>();
 
         TextBox txtSearch;
+        Button btnExit;
         Button btnSettings;
         Button btnRefresh;
         Button btnViewMode;
+        LinkLabel lnkVersion;
         ListView listView;
         TreeView treeView;
         StatusStrip statusStrip;
@@ -368,12 +465,10 @@ namespace RdpConsole
         bool reallyExit;
         bool trayHintShown;
 
-        // Глобальна гаряча клавіша Ctrl+Alt+R -- відкриває вікно швидкого пошуку
-        // з будь-якого місця в Windows, навіть коли застосунок згорнутий у трей.
+        // Глобальна гаряча клавіша (за замовчуванням Ctrl+Alt+R, змінюється в
+        // Налаштуваннях) -- відкриває вікно швидкого пошуку з будь-якого місця в
+        // Windows, навіть коли застосунок згорнутий у трей.
         const int HOTKEY_ID = 0xB105;
-        const uint MOD_CONTROL = 0x0002;
-        const uint MOD_ALT = 0x0001;
-        const uint VK_R = 0x52;
         const int WM_HOTKEY = 0x0312;
         bool hotkeyRegistered;
 
@@ -419,7 +514,7 @@ namespace RdpConsole
             StartPosition = FormStartPosition.CenterScreen;
             Width = settings.WindowWidth > 0 ? settings.WindowWidth : 940;
             Height = settings.WindowHeight > 0 ? settings.WindowHeight : 620;
-            MinimumSize = new Size(560, 380);
+            MinimumSize = new Size(900, 380);
             KeyPreview = true;
 
             BuildUi();
@@ -517,6 +612,29 @@ namespace RdpConsole
         {
             var topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
 
+            lnkVersion = new LinkLabel
+            {
+                Dock = DockStyle.Left,
+                Width = 66,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Text = "v" + Program.AppVersion,
+                LinkColor = SystemColors.HotTrack
+            };
+            lnkVersion.LinkClicked += (s, e) => CheckForUpdates(true);
+
+            var lnkRepo = new LinkLabel
+            {
+                Dock = DockStyle.Left,
+                Width = 24,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Text = "🔗"
+            };
+            lnkRepo.LinkClicked += (s, e) =>
+            {
+                try { Process.Start(new ProcessStartInfo(Program.RepoUrl) { UseShellExecute = true }); }
+                catch { }
+            };
+
             txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320 };
             SetPlaceholder(txtSearch, "Пошук підключення...");
             txtSearch.TextChanged += (s, e) => { ClearPlaceholderState(); ApplyFilter(); };
@@ -528,6 +646,9 @@ namespace RdpConsole
             btnSettings = new Button { Dock = DockStyle.Right, Width = 110, Text = "Налаштування" };
             btnSettings.Click += (s, e) => OpenSettings();
 
+            btnExit = new Button { Dock = DockStyle.Right, Width = 150, Text = "Завершити програму" };
+            btnExit.Click += (s, e) => ExitApplication();
+
             btnViewMode = new Button { Dock = DockStyle.Right, Width = 100 };
             btnViewMode.Click += (s, e) =>
             {
@@ -537,6 +658,9 @@ namespace RdpConsole
             };
 
             topPanel.Controls.Add(txtSearch);
+            topPanel.Controls.Add(lnkVersion);
+            topPanel.Controls.Add(lnkRepo);
+            topPanel.Controls.Add(btnExit);
             topPanel.Controls.Add(btnSettings);
             topPanel.Controls.Add(btnRefresh);
             topPanel.Controls.Add(btnViewMode);
@@ -659,29 +783,162 @@ namespace RdpConsole
             EnsureRootFolder();
             RescanAndFill();
             RegisterGlobalHotkey();
+            CheckForUpdates(false);
+        }
+
+        // manual=false -- тиха фонова перевірка при запуску: якщо є новіша версія,
+        // просто підсвічує посилання (без спливаючого вікна), як задумано.
+        // manual=true -- клік по посиланню: завжди показує результат діалогом
+        // (пропозицію оновитися або підтвердження, що версія вже остання).
+        void CheckForUpdates(bool manual)
+        {
+            var originalText = lnkVersion.Text;
+            lnkVersion.Enabled = false;
+            if (manual) lnkVersion.Text = "Перевірка...";
+
+            var thread = new Thread(() =>
+            {
+                string latest = null;
+                Exception error = null;
+                try
+                {
+                    using (var wc = new WebClient())
+                    {
+                        latest = wc.DownloadString(UpdateChecker.VersionUrl).Trim();
+                    }
+                }
+                catch (Exception ex) { error = ex; }
+
+                if (IsDisposed) return;
+                try { BeginInvoke(new Action(() => OnUpdateCheckResult(latest, error, manual, originalText))); }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        void OnUpdateCheckResult(string latestVersion, Exception error, bool manual, string originalText)
+        {
+            lnkVersion.Enabled = true;
+
+            if (error != null)
+            {
+                lnkVersion.Text = originalText;
+                if (manual)
+                {
+                    MessageBox.Show(this, "Не вдалося перевірити оновлення:\n" + error.Message,
+                        "RDP Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
+            bool isNewer = UpdateChecker.IsNewer(latestVersion, Program.AppVersion);
+            if (isNewer)
+            {
+                lnkVersion.Text = "v" + Program.AppVersion + " ↑";
+                lnkVersion.LinkColor = Color.FromArgb(230, 126, 34);
+
+                if (manual)
+                {
+                    var r = MessageBox.Show(this,
+                        "Доступна нова версія " + latestVersion + " (поточна: " + Program.AppVersion + ").\n\n" +
+                        "Завантажити й оновити зараз? Застосунок перезапуститься автоматично.",
+                        "Оновлення RDP Console", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                    if (r == DialogResult.Yes) StartDownloadAndInstall();
+                }
+            }
+            else
+            {
+                lnkVersion.Text = "v" + Program.AppVersion;
+                lnkVersion.LinkColor = SystemColors.HotTrack;
+                if (manual)
+                {
+                    MessageBox.Show(this, "У вас уже остання версія (" + Program.AppVersion + ").",
+                        "RDP Console", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+            }
+        }
+
+        void StartDownloadAndInstall()
+        {
+            lnkVersion.Enabled = false;
+            lnkVersion.Text = "Завантаження...";
+
+            var thread = new Thread(() =>
+            {
+                Exception error = null;
+                string tempPath = Path.Combine(Path.GetTempPath(), "RdpConsole_update_" + Guid.NewGuid().ToString("N") + ".exe");
+                try
+                {
+                    using (var wc = new WebClient())
+                    {
+                        wc.DownloadFile(UpdateChecker.DownloadUrl, tempPath);
+                    }
+                }
+                catch (Exception ex) { error = ex; }
+
+                if (IsDisposed) return;
+                try { BeginInvoke(new Action(() => OnDownloadComplete(tempPath, error))); }
+                catch { }
+            });
+            thread.IsBackground = true;
+            thread.Start();
+        }
+
+        void OnDownloadComplete(string tempPath, Exception error)
+        {
+            if (error != null)
+            {
+                lnkVersion.Enabled = true;
+                lnkVersion.Text = "v" + Program.AppVersion + " ↑";
+                MessageBox.Show(this, "Не вдалося завантажити оновлення:\n" + error.Message,
+                    "RDP Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            UpdateChecker.PrepareUpdateBatch(tempPath);
+            ExitApplication();
         }
 
         void RegisterGlobalHotkey()
         {
-            hotkeyRegistered = RegisterHotKey(Handle, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_R);
+            if (settings.HotkeyKey == 0)
+            {
+                // Користувач явно вимкнув гарячу клавішу в Налаштуваннях.
+                trayIcon.Text = "Консоль підключення по RDP  •  гаряча клавіша вимкнена";
+                return;
+            }
+
+            hotkeyRegistered = RegisterHotKey(Handle, HOTKEY_ID, settings.HotkeyModifiers, settings.HotkeyKey);
 
             // Спливаючі повідомлення трею на Windows 11 часто не показуються (залежить від
             // налаштувань сповіщень/фокусування), тому статус гарячої клавіші додатково
             // видно в будь-який момент через підказку іконки в треї (наведення мишею), а
             // про невдалу реєстрацію одразу повідомляємо надійним MessageBox, а не лише
             // (ненадійною) бульбашкою.
+            var combo = HotkeyUtil.Format(settings.HotkeyModifiers, settings.HotkeyKey);
             trayIcon.Text = "Консоль підключення по RDP" +
-                (hotkeyRegistered ? "  •  Ctrl+Alt+R" : "  •  Ctrl+Alt+R неактивна");
+                (hotkeyRegistered ? "  •  " + combo : "  •  " + combo + " неактивна");
 
             if (!hotkeyRegistered)
             {
                 int errorCode = Marshal.GetLastWin32Error();
                 MessageBox.Show(this,
-                    "Не вдалося зареєструвати глобальну гарячу клавішу Ctrl+Alt+R " +
+                    "Не вдалося зареєструвати глобальну гарячу клавішу " + combo + " " +
                     "(код помилки Windows: " + errorCode + "). " +
                     "Ймовірно, цю комбінацію вже використовує інша програма.\n\n" +
-                    "Застосунок продовжує працювати, просто ця клавіша не спрацьовуватиме.",
+                    "Застосунок продовжує працювати, просто ця клавіша не спрацьовуватиме. " +
+                    "Можна обрати іншу комбінацію в Налаштуваннях.",
                     "RDP Console", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        void UnregisterGlobalHotkey()
+        {
+            if (hotkeyRegistered)
+            {
+                UnregisterHotKey(Handle, HOTKEY_ID);
+                hotkeyRegistered = false;
             }
         }
 
@@ -1070,9 +1327,17 @@ namespace RdpConsole
             {
                 if (f.ShowDialog(this) == DialogResult.OK)
                 {
+                    bool hotkeyChanged = settings.HotkeyModifiers != f.ResultSettings.HotkeyModifiers ||
+                                          settings.HotkeyKey != f.ResultSettings.HotkeyKey;
                     settings = f.ResultSettings;
                     SettingsManager.Save(settings);
                     RescanAndFill();
+
+                    if (hotkeyChanged)
+                    {
+                        UnregisterGlobalHotkey();
+                        RegisterGlobalHotkey();
+                    }
                 }
             }
         }
@@ -1093,16 +1358,12 @@ namespace RdpConsole
             }
             SettingsManager.Save(settings);
             trayIcon.Visible = false;
-            if (hotkeyRegistered)
-            {
-                UnregisterHotKey(Handle, HOTKEY_ID);
-                hotkeyRegistered = false;
-            }
+            UnregisterGlobalHotkey();
         }
 
         // Повідомлення від другого запущеного екземпляра (див. Program.Main): замість
         // другої копії застосунку -- просто показуємо вже наявне вікно.
-        // WM_HOTKEY -- спрацювала глобальна гаряча клавіша Ctrl+Alt+R.
+        // WM_HOTKEY -- спрацювала глобальна гаряча клавіша.
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == Program.WM_SHOWME)
@@ -1155,7 +1416,7 @@ namespace RdpConsole
             lstResults.KeyDown += LstResults_KeyDown;
             lstResults.MouseDoubleClick += (s, e) => ConnectSelected();
 
-            var btnExit = new Button { Text = "Закрити програму", Left = 8, Top = 286, Width = 150, Height = 26 };
+            var btnExit = new Button { Text = "Завершити програму", Left = 8, Top = 286, Width = 150, Height = 26 };
             btnExit.Click += (s, e) =>
             {
                 Close();
@@ -1312,6 +1573,9 @@ namespace RdpConsole
         TextBox txtDefaultPassword;
         CheckBox chkShowDefaultPassword;
         CheckBox chkClearDefaultPassword;
+        TextBox txtHotkey;
+        uint capturedHotkeyModifiers;
+        uint capturedHotkeyVk;
 
         public SettingsForm(AppSettings current)
         {
@@ -1324,8 +1588,11 @@ namespace RdpConsole
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Width = 480;
-            Height = 320;
+            Height = 420;
             Font = new Font("Segoe UI", 9.5f);
+
+            capturedHotkeyModifiers = working.HotkeyModifiers;
+            capturedHotkeyVk = working.HotkeyKey;
 
             BuildUi();
         }
@@ -1338,6 +1605,9 @@ namespace RdpConsole
                 WindowWidth = s.WindowWidth,
                 WindowHeight = s.WindowHeight,
                 DefaultEncryptedPassword = s.DefaultEncryptedPassword,
+                HierarchyView = s.HierarchyView,
+                HotkeyModifiers = s.HotkeyModifiers,
+                HotkeyKey = s.HotkeyKey,
                 EncryptedPasswords = s.EncryptedPasswords != null
                     ? new Dictionary<string, string>(s.EncryptedPasswords)
                     : new Dictionary<string, string>()
@@ -1388,9 +1658,47 @@ namespace RdpConsole
                 Text = "Залиште поле порожнім, щоб не змінювати вже збережений пароль за замовчуванням."
             };
 
-            var btnOk = new Button { Text = "OK", Left = 280, Top = 236, Width = 85 };
+            var lblHotkey = new Label { Text = "Гаряча клавіша (відкриває вікно пошуку з будь-якого місця):", Left = 12, Top = 198, Width = 440 };
+
+            txtHotkey = new TextBox
+            {
+                Left = 12,
+                Top = 220,
+                Width = 250,
+                ReadOnly = true,
+                Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk)
+            };
+            txtHotkey.KeyDown += TxtHotkey_KeyDown;
+
+            var btnResetHotkey = new Button { Text = "Типова", Left = 268, Top = 218, Width = 80 };
+            btnResetHotkey.Click += (s, e) =>
+            {
+                capturedHotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
+                capturedHotkeyVk = HotkeyUtil.DefaultVk;
+                txtHotkey.Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk);
+            };
+
+            var btnClearHotkey = new Button { Text = "Вимкнути", Left = 352, Top = 218, Width = 80 };
+            btnClearHotkey.Click += (s, e) =>
+            {
+                capturedHotkeyModifiers = 0;
+                capturedHotkeyVk = 0;
+                txtHotkey.Text = HotkeyUtil.Format(0, 0);
+            };
+
+            var lblHotkeyHint = new Label
+            {
+                Left = 12,
+                Top = 250,
+                Width = 440,
+                Height = 32,
+                ForeColor = SystemColors.GrayText,
+                Text = "Клацніть у поле й натисніть бажану комбінацію (потрібен хоча б один Ctrl/Alt/Shift)."
+            };
+
+            var btnOk = new Button { Text = "OK", Left = 280, Top = 336, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 236, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 336, Width = 85, DialogResult = DialogResult.Cancel };
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -1403,8 +1711,46 @@ namespace RdpConsole
             Controls.Add(chkShowDefaultPassword);
             Controls.Add(chkClearDefaultPassword);
             Controls.Add(lblHint);
+            Controls.Add(lblHotkey);
+            Controls.Add(txtHotkey);
+            Controls.Add(btnResetHotkey);
+            Controls.Add(btnClearHotkey);
+            Controls.Add(lblHotkeyHint);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
+        }
+
+        void TxtHotkey_KeyDown(object sender, KeyEventArgs e)
+        {
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.Menu ||
+                e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+            {
+                return; // чекаємо на клавішу, що не є самим модифікатором
+            }
+
+            if (e.KeyCode == Keys.Escape)
+            {
+                txtHotkey.Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk);
+                return;
+            }
+
+            if (!e.Control && !e.Alt && !e.Shift)
+            {
+                txtHotkey.Text = "Потрібен хоча б один із Ctrl / Alt / Shift...";
+                return;
+            }
+
+            uint mods = 0;
+            if (e.Control) mods |= HotkeyUtil.MOD_CONTROL;
+            if (e.Alt) mods |= HotkeyUtil.MOD_ALT;
+            if (e.Shift) mods |= HotkeyUtil.MOD_SHIFT;
+
+            capturedHotkeyModifiers = mods;
+            capturedHotkeyVk = (uint)e.KeyCode;
+            txtHotkey.Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk);
         }
 
         static string SafeDir(string p)
@@ -1432,6 +1778,8 @@ namespace RdpConsole
             }
 
             working.RootFolder = root;
+            working.HotkeyModifiers = capturedHotkeyModifiers;
+            working.HotkeyKey = capturedHotkeyVk;
             ResultSettings = working;
             DialogResult = DialogResult.OK;
             Close();
@@ -1440,6 +1788,9 @@ namespace RdpConsole
 
     public static class Program
     {
+        public const string AppVersion = "1.1.0";
+        public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
+
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
         // (уже запущений) екземпляр слухає його у WndProc і показує своє вікно.
         public static readonly int WM_SHOWME = RegisterWindowMessage("RdpConsole_ShowMainWindow_v1");
