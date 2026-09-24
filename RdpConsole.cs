@@ -391,11 +391,6 @@ namespace RdpConsole
         public const string VersionUrl = "https://raw.githubusercontent.com/Kolp305/RdpConsole/master/version.txt";
         public const string DownloadUrl = "https://github.com/Kolp305/RdpConsole/releases/latest/download/RdpConsole.exe";
 
-        static UpdateChecker()
-        {
-            try { ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12; } catch { }
-        }
-
         public static bool IsNewer(string remoteVersion, string currentVersion)
         {
             if (string.IsNullOrWhiteSpace(remoteVersion)) return false;
@@ -612,27 +607,40 @@ namespace RdpConsole
         {
             var topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
 
-            lnkVersion = new LinkLabel
+            // Стиль версії/посилання на репозиторій -- як у ShadowSessionTool: маленька
+            // намальована іконка-ланцюжок (а не емодзі, яке по-різному рендериться) і
+            // підкреслений текст версії, що виглядає як гіперпосилання.
+            var btnRepo = new Button
             {
                 Dock = DockStyle.Left,
-                Width = 66,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Text = "v" + Program.AppVersion,
-                LinkColor = SystemColors.HotTrack
+                Width = 26,
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Image = CreateLinkIcon(SystemColors.GrayText),
+                ImageAlign = ContentAlignment.MiddleCenter
             };
-            lnkVersion.LinkClicked += (s, e) => CheckForUpdates(true);
-
-            var lnkRepo = new LinkLabel
-            {
-                Dock = DockStyle.Left,
-                Width = 24,
-                TextAlign = ContentAlignment.MiddleCenter,
-                Text = "🔗"
-            };
-            lnkRepo.LinkClicked += (s, e) =>
+            btnRepo.FlatAppearance.BorderSize = 0;
+            btnRepo.Click += (s, e) =>
             {
                 try { Process.Start(new ProcessStartInfo(Program.RepoUrl) { UseShellExecute = true }); }
                 catch { }
+            };
+            var repoToolTip = new ToolTip();
+            repoToolTip.SetToolTip(btnRepo, "Відкрити репозиторій на GitHub");
+
+            lnkVersion = new LinkLabel
+            {
+                Dock = DockStyle.Left,
+                Width = 70,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Text = "v" + Program.AppVersion,
+                LinkColor = SystemColors.GrayText,
+                LinkBehavior = LinkBehavior.AlwaysUnderline
+            };
+            lnkVersion.LinkClicked += (s, e) =>
+            {
+                if (pendingUpdateVersion != null) PromptUpdate(pendingUpdateVersion);
+                else CheckForUpdates(true);
             };
 
             txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320 };
@@ -659,7 +667,7 @@ namespace RdpConsole
 
             topPanel.Controls.Add(txtSearch);
             topPanel.Controls.Add(lnkVersion);
-            topPanel.Controls.Add(lnkRepo);
+            topPanel.Controls.Add(btnRepo);
             topPanel.Controls.Add(btnExit);
             topPanel.Controls.Add(btnSettings);
             topPanel.Controls.Add(btnRefresh);
@@ -786,6 +794,29 @@ namespace RdpConsole
             CheckForUpdates(false);
         }
 
+        string pendingUpdateVersion;
+
+        // Малює просту іконку-ланцюжок (2 дуги + перемичка), як у ShadowSessionTool --
+        // надійніше й чіткіше за emoji-символ, який по-різному рендериться в списках.
+        static Bitmap CreateLinkIcon(Color color)
+        {
+            var bmp = new Bitmap(16, 16);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.Clear(Color.Transparent);
+                using (var pen = new Pen(color, 2f))
+                {
+                    pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                    pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                    g.DrawArc(pen, 1, 5, 7, 7, 90, 180);
+                    g.DrawArc(pen, 8, 4, 7, 7, 270, 180);
+                    g.DrawLine(pen, 5, 8, 11, 8);
+                }
+            }
+            return bmp;
+        }
+
         // manual=false -- тиха фонова перевірка при запуску: якщо є новіша версія,
         // просто підсвічує посилання (без спливаючого вікна), як задумано.
         // manual=true -- клік по посиланню: завжди показує результат діалогом
@@ -802,8 +833,16 @@ namespace RdpConsole
                 Exception error = null;
                 try
                 {
+                    // ВАЖЛИВО: виставляти TLS 1.2 треба саме тут, безпосередньо перед
+                    // запитом. У статичному конструкторі UpdateChecker це НЕ спрацьовувало:
+                    // звернення лише до const-полів (VersionUrl/DownloadUrl) не запускає
+                    // статичний конструктор типу (const-и вбудовуються компілятором),
+                    // тож ServicePointManager.SecurityProtocol так і лишався типовим і
+                    // запит падав з "Не удалось создать защищенный канал SSL/TLS".
+                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                     using (var wc = new WebClient())
                     {
+                        wc.Headers.Add("User-Agent", "RdpConsole");
                         latest = wc.DownloadString(UpdateChecker.VersionUrl).Trim();
                     }
                 }
@@ -835,28 +874,32 @@ namespace RdpConsole
             bool isNewer = UpdateChecker.IsNewer(latestVersion, Program.AppVersion);
             if (isNewer)
             {
+                pendingUpdateVersion = latestVersion;
                 lnkVersion.Text = "v" + Program.AppVersion + " ↑";
-                lnkVersion.LinkColor = Color.FromArgb(230, 126, 34);
+                lnkVersion.LinkColor = Color.OrangeRed;
 
-                if (manual)
-                {
-                    var r = MessageBox.Show(this,
-                        "Доступна нова версія " + latestVersion + " (поточна: " + Program.AppVersion + ").\n\n" +
-                        "Завантажити й оновити зараз? Застосунок перезапуститься автоматично.",
-                        "Оновлення RDP Console", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
-                    if (r == DialogResult.Yes) StartDownloadAndInstall();
-                }
+                if (manual) PromptUpdate(latestVersion);
             }
             else
             {
+                pendingUpdateVersion = null;
                 lnkVersion.Text = "v" + Program.AppVersion;
-                lnkVersion.LinkColor = SystemColors.HotTrack;
+                lnkVersion.LinkColor = SystemColors.GrayText;
                 if (manual)
                 {
                     MessageBox.Show(this, "У вас уже остання версія (" + Program.AppVersion + ").",
                         "RDP Console", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
             }
+        }
+
+        void PromptUpdate(string newVersion)
+        {
+            var r = MessageBox.Show(this,
+                "Доступна нова версія " + newVersion + " (поточна: " + Program.AppVersion + ").\n\n" +
+                "Завантажити й оновити зараз? Застосунок перезапуститься автоматично.",
+                "Оновлення RDP Console", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            if (r == DialogResult.Yes) StartDownloadAndInstall();
         }
 
         void StartDownloadAndInstall()
@@ -870,8 +913,10 @@ namespace RdpConsole
                 string tempPath = Path.Combine(Path.GetTempPath(), "RdpConsole_update_" + Guid.NewGuid().ToString("N") + ".exe");
                 try
                 {
+                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
                     using (var wc = new WebClient())
                     {
+                        wc.Headers.Add("User-Agent", "RdpConsole");
                         wc.DownloadFile(UpdateChecker.DownloadUrl, tempPath);
                     }
                 }
@@ -1788,7 +1833,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.1.0";
+        public const string AppVersion = "1.1.1";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
