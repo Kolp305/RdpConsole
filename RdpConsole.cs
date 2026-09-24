@@ -604,7 +604,12 @@ namespace RdpConsole
                 "start \"\" \"" + currentExe + "\"\r\n" +
                 "del \"%~f0\"\r\n";
 
-            File.WriteAllText(batchPath, script, Encoding.ASCII);
+            // ВАЖЛИВО: не Encoding.ASCII -- якщо шлях до застосунку містить кириличні
+            // символи (наприклад, ім'я користувача Windows типу "Ярик"), ASCII замінює
+            // їх на "?", і команди copy/start у .bat отримують зіпсований, неіснуючий
+            // шлях. Encoding.Default -- поточна ANSI-кодова сторінка системи (напр.
+            // Windows-1251) -- саме та, яку cmd.exe й так очікує для .bat за замовчуванням.
+            File.WriteAllText(batchPath, script, Encoding.Default);
 
             var psi = new ProcessStartInfo("cmd.exe", "/c \"" + batchPath + "\"")
             {
@@ -2079,7 +2084,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.2.0";
+        public const string AppVersion = "1.2.1";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
