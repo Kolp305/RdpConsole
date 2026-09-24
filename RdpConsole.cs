@@ -37,6 +37,164 @@ namespace RdpConsole
         }
     }
 
+    public class ThemeColors
+    {
+        public Color FormBack;
+        public Color PanelBack;
+        public Color Foreground;
+        public Color ControlBack;
+        public Color ControlFore;
+        public Color ButtonBack;
+        public Color ButtonFore;
+        public Color ButtonBorder;
+        public Color ButtonHover;
+        public Color ButtonPressed;
+        public Color AccentLink;
+        public Color GridLines;
+    }
+
+    // Проста система тем -- Світла / Темна / Синя (за прикладом трьох тем
+    // ShadowSessionTool). Кожна тема -- набір кольорів, які рекурсивно
+    // застосовуються до форми й усіх дочірніх контролів у ApplyRecursive.
+    public static class ThemeManager
+    {
+        public const string LightThemeName = "Light";
+        public const string DarkThemeName = "Dark";
+        public const string BlueThemeName = "Blue";
+
+        public static readonly ThemeColors Light = new ThemeColors
+        {
+            FormBack = Color.FromArgb(245, 245, 245),
+            PanelBack = Color.White,
+            Foreground = Color.FromArgb(30, 30, 30),
+            ControlBack = Color.White,
+            ControlFore = Color.FromArgb(30, 30, 30),
+            ButtonBack = Color.White,
+            ButtonFore = Color.FromArgb(30, 30, 30),
+            ButtonBorder = Color.FromArgb(200, 200, 200),
+            ButtonHover = Color.FromArgb(232, 232, 232),
+            ButtonPressed = Color.FromArgb(215, 215, 215),
+            AccentLink = SystemColors.GrayText,
+            GridLines = Color.FromArgb(225, 225, 225)
+        };
+
+        public static readonly ThemeColors Dark = new ThemeColors
+        {
+            FormBack = Color.FromArgb(32, 32, 32),
+            PanelBack = Color.FromArgb(45, 45, 48),
+            Foreground = Color.FromArgb(230, 230, 230),
+            ControlBack = Color.FromArgb(37, 37, 38),
+            ControlFore = Color.FromArgb(230, 230, 230),
+            ButtonBack = Color.FromArgb(62, 62, 66),
+            ButtonFore = Color.FromArgb(230, 230, 230),
+            ButtonBorder = Color.FromArgb(80, 80, 84),
+            ButtonHover = Color.FromArgb(80, 80, 84),
+            ButtonPressed = Color.FromArgb(95, 95, 100),
+            AccentLink = Color.FromArgb(90, 160, 220),
+            GridLines = Color.FromArgb(60, 60, 63)
+        };
+
+        public static readonly ThemeColors Blue = new ThemeColors
+        {
+            FormBack = Color.FromArgb(235, 242, 250),
+            PanelBack = Color.FromArgb(222, 235, 250),
+            Foreground = Color.FromArgb(20, 40, 65),
+            ControlBack = Color.White,
+            ControlFore = Color.FromArgb(20, 40, 65),
+            ButtonBack = Color.FromArgb(210, 228, 247),
+            ButtonFore = Color.FromArgb(20, 40, 65),
+            ButtonBorder = Color.FromArgb(150, 185, 220),
+            ButtonHover = Color.FromArgb(190, 215, 240),
+            ButtonPressed = Color.FromArgb(170, 200, 230),
+            AccentLink = Color.FromArgb(30, 90, 160),
+            GridLines = Color.FromArgb(200, 220, 240)
+        };
+
+        public static ThemeColors Get(string themeName)
+        {
+            if (themeName == DarkThemeName) return Dark;
+            if (themeName == BlueThemeName) return Blue;
+            return Light;
+        }
+
+        public static void Apply(Control root, string themeName)
+        {
+            var c = Get(themeName);
+            ApplyRecursive(root, c);
+        }
+
+        static void ApplyRecursive(Control control, ThemeColors c)
+        {
+            if (control is Form)
+            {
+                control.BackColor = c.FormBack;
+                control.ForeColor = c.Foreground;
+            }
+            else if (control is Panel || control is GroupBox)
+            {
+                control.BackColor = c.PanelBack;
+                control.ForeColor = c.Foreground;
+            }
+            else if (control is Button)
+            {
+                var b = (Button)control;
+                bool iconOnly = (b.Tag as string) == "iconOnly";
+                b.FlatStyle = FlatStyle.Flat;
+                b.BackColor = iconOnly ? c.PanelBack : c.ButtonBack;
+                b.ForeColor = iconOnly ? c.Foreground : c.ButtonFore;
+                b.FlatAppearance.BorderColor = c.ButtonBorder;
+                b.FlatAppearance.BorderSize = iconOnly ? 0 : 1;
+                b.FlatAppearance.MouseOverBackColor = c.ButtonHover;
+                b.FlatAppearance.MouseDownBackColor = c.ButtonPressed;
+            }
+            else if (control is TextBox || control is ComboBox)
+            {
+                control.BackColor = c.ControlBack;
+                control.ForeColor = c.ControlFore;
+            }
+            else if (control is ListView)
+            {
+                control.BackColor = c.ControlBack;
+                control.ForeColor = c.ControlFore;
+            }
+            else if (control is TreeView)
+            {
+                control.BackColor = c.ControlBack;
+                control.ForeColor = c.ControlFore;
+            }
+            else if (control is ListBox)
+            {
+                control.BackColor = c.ControlBack;
+                control.ForeColor = c.ControlFore;
+            }
+            else if (control is StatusStrip)
+            {
+                control.BackColor = c.PanelBack;
+                control.ForeColor = c.Foreground;
+            }
+            else if (control is LinkLabel)
+            {
+                var ll = (LinkLabel)control;
+                ll.LinkColor = c.AccentLink;
+                ll.ForeColor = c.Foreground;
+                ll.BackColor = Color.Transparent;
+            }
+            else if (control is Label || control is CheckBox || control is RadioButton)
+            {
+                control.ForeColor = c.Foreground;
+                control.BackColor = Color.Transparent;
+            }
+            else
+            {
+                control.BackColor = c.FormBack;
+                control.ForeColor = c.Foreground;
+            }
+
+            foreach (Control child in control.Controls)
+                ApplyRecursive(child, c);
+        }
+    }
+
     [DataContract]
     public class AppSettings
     {
@@ -48,6 +206,7 @@ namespace RdpConsole
         [DataMember] public bool HierarchyView { get; set; }
         [DataMember] public uint HotkeyModifiers { get; set; }
         [DataMember] public uint HotkeyKey { get; set; }
+        [DataMember] public string Theme { get; set; }
 
         public static AppSettings CreateDefault()
         {
@@ -59,7 +218,8 @@ namespace RdpConsole
                 EncryptedPasswords = new Dictionary<string, string>(),
                 HierarchyView = true,
                 HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT,
-                HotkeyKey = HotkeyUtil.DefaultVk
+                HotkeyKey = HotkeyUtil.DefaultVk,
+                Theme = ThemeManager.LightThemeName
             };
         }
     }
@@ -94,6 +254,7 @@ namespace RdpConsole
                             s.HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
                             s.HotkeyKey = HotkeyUtil.DefaultVk;
                         }
+                        if (string.IsNullOrEmpty(s.Theme)) s.Theme = ThemeManager.LightThemeName;
                         return s;
                     }
                 }
@@ -631,6 +792,7 @@ namespace RdpConsole
         Button btnSettings;
         Button btnRefresh;
         Button btnViewMode;
+        Button btnRepo;
         LinkLabel lnkVersion;
         ListView listView;
         TreeView treeView;
@@ -792,12 +954,13 @@ namespace RdpConsole
             // Стиль версії/посилання на репозиторій -- як у ShadowSessionTool: маленька
             // намальована іконка-ланцюжок (а не емодзі, яке по-різному рендериться) і
             // підкреслений текст версії, що виглядає як гіперпосилання.
-            var btnRepo = new Button
+            btnRepo = new Button
             {
                 Dock = DockStyle.Left,
                 Width = 26,
                 FlatStyle = FlatStyle.Flat,
                 Cursor = Cursors.Hand,
+                Tag = "iconOnly",
                 Image = CreateLinkIcon(SystemColors.GrayText),
                 ImageAlign = ContentAlignment.MiddleCenter
             };
@@ -920,6 +1083,18 @@ namespace RdpConsole
             Controls.Add(listView);
             Controls.Add(topPanel);
             Controls.Add(statusStrip);
+
+            ApplyTheme();
+        }
+
+        void ApplyTheme()
+        {
+            ThemeManager.Apply(this, settings.Theme);
+            var c = ThemeManager.Get(settings.Theme);
+            btnRepo.Image = CreateLinkIcon(c.AccentLink);
+            lnkVersion.LinkColor = c.AccentLink;
+            searchNormalColor = c.ControlFore;
+            txtSearch.ForeColor = searchShowingPlaceholder ? PlaceholderColor : searchNormalColor;
         }
 
         // ---- Placeholder helper для TextBox (WinForms не має вбудованого) ----
@@ -1456,7 +1631,7 @@ namespace RdpConsole
 
         void SavePasswordFor(RdpEntry entry)
         {
-            using (var dlg = new PasswordDialog(entry.DisplayName))
+            using (var dlg = new PasswordDialog(entry.DisplayName, settings.Theme))
             {
                 if (dlg.ShowDialog(this) == DialogResult.OK)
                 {
@@ -1497,6 +1672,7 @@ namespace RdpConsole
                     settings = f.ResultSettings;
                     SettingsManager.Save(settings);
                     RescanAndFill();
+                    ApplyTheme();
 
                     if (hotkeyChanged)
                     {
@@ -1687,6 +1863,8 @@ namespace RdpConsole
             Controls.Add(lstResults);
             Controls.Add(treeResults);
             Controls.Add(btnExit);
+
+            ThemeManager.Apply(this, settings.Theme);
         }
 
         void UpdateToggleButtonText()
@@ -1813,7 +1991,7 @@ namespace RdpConsole
         TextBox txtPassword;
         CheckBox chkShow;
 
-        public PasswordDialog(string forName)
+        public PasswordDialog(string forName, string themeName)
         {
             AutoScaleMode = AutoScaleMode.None;
             Text = "Пароль для \"" + forName + "\"";
@@ -1844,6 +2022,8 @@ namespace RdpConsole
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
 
+            ThemeManager.Apply(this, themeName);
+
             Load += (s, e) => txtPassword.Focus();
         }
 
@@ -1872,6 +2052,9 @@ namespace RdpConsole
         TextBox txtHotkey;
         uint capturedHotkeyModifiers;
         uint capturedHotkeyVk;
+        RadioButton radioThemeLight;
+        RadioButton radioThemeDark;
+        RadioButton radioThemeBlue;
 
         public SettingsForm(AppSettings current)
         {
@@ -1884,7 +2067,7 @@ namespace RdpConsole
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Width = 480;
-            Height = 420;
+            Height = 470;
             Font = new Font("Segoe UI", 9.5f);
 
             capturedHotkeyModifiers = working.HotkeyModifiers;
@@ -1904,6 +2087,7 @@ namespace RdpConsole
                 HierarchyView = s.HierarchyView,
                 HotkeyModifiers = s.HotkeyModifiers,
                 HotkeyKey = s.HotkeyKey,
+                Theme = s.Theme,
                 EncryptedPasswords = s.EncryptedPasswords != null
                     ? new Dictionary<string, string>(s.EncryptedPasswords)
                     : new Dictionary<string, string>()
@@ -1992,9 +2176,21 @@ namespace RdpConsole
                 Text = "Клацніть у поле й натисніть бажану комбінацію (потрібен хоча б один Ctrl/Alt/Shift)."
             };
 
-            var btnOk = new Button { Text = "OK", Left = 280, Top = 336, Width = 85 };
+            var lblTheme = new Label { Text = "Тема оформлення:", Left = 12, Top = 290, Width = 440 };
+            radioThemeLight = new RadioButton { Text = "Світла", Left = 12, Top = 312, Width = 100 };
+            radioThemeDark = new RadioButton { Text = "Темна", Left = 120, Top = 312, Width = 100 };
+            radioThemeBlue = new RadioButton { Text = "Синя", Left = 228, Top = 312, Width = 100 };
+            if (working.Theme == ThemeManager.DarkThemeName) radioThemeDark.Checked = true;
+            else if (working.Theme == ThemeManager.BlueThemeName) radioThemeBlue.Checked = true;
+            else radioThemeLight.Checked = true;
+            EventHandler onThemePicked = (s, e) => ThemeManager.Apply(this, SelectedThemeName());
+            radioThemeLight.CheckedChanged += onThemePicked;
+            radioThemeDark.CheckedChanged += onThemePicked;
+            radioThemeBlue.CheckedChanged += onThemePicked;
+
+            var btnOk = new Button { Text = "OK", Left = 280, Top = 386, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 336, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 386, Width = 85, DialogResult = DialogResult.Cancel };
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -2012,8 +2208,21 @@ namespace RdpConsole
             Controls.Add(btnResetHotkey);
             Controls.Add(btnClearHotkey);
             Controls.Add(lblHotkeyHint);
+            Controls.Add(lblTheme);
+            Controls.Add(radioThemeLight);
+            Controls.Add(radioThemeDark);
+            Controls.Add(radioThemeBlue);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
+
+            ThemeManager.Apply(this, working.Theme);
+        }
+
+        string SelectedThemeName()
+        {
+            if (radioThemeDark.Checked) return ThemeManager.DarkThemeName;
+            if (radioThemeBlue.Checked) return ThemeManager.BlueThemeName;
+            return ThemeManager.LightThemeName;
         }
 
         void TxtHotkey_KeyDown(object sender, KeyEventArgs e)
@@ -2076,6 +2285,7 @@ namespace RdpConsole
             working.RootFolder = root;
             working.HotkeyModifiers = capturedHotkeyModifiers;
             working.HotkeyKey = capturedHotkeyVk;
+            working.Theme = SelectedThemeName();
             ResultSettings = working;
             DialogResult = DialogResult.OK;
             Close();
