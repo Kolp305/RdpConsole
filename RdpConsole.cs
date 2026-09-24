@@ -224,6 +224,183 @@ namespace RdpConsole
         }
     }
 
+    // Реальні іконки папки та .rdp-файлу з провідника Windows (той самий API, яким
+    // користується сам Explorer) -- виглядають так само, як у файловому менеджері,
+    // на відміну від будь-якого самостійно намальованого чи emoji-замінника.
+    public static class ShellIcons
+    {
+        // SHGFI_USEFILEATTRIBUTES (іконка за розширенням/атрибутом без реального файлу)
+        // на практиці повертає узагальнену "порожню" іконку замість справжньої
+        // зареєстрованої -- тому іконки дістаються з РЕАЛЬНИХ шляхів: наявної теки
+        // (%TEMP%) для папки, і щойно створеного порожнього *.rdp для RDP-файлу.
+        [DllImport("shell32.dll", CharSet = CharSet.Auto)]
+        static extern IntPtr SHGetFileInfo(string pszPath, uint dwFileAttributes, ref SHFILEINFO psfi, uint cbFileInfo, uint uFlags);
+
+        [DllImport("user32.dll")]
+        static extern bool DestroyIcon(IntPtr hIcon);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct SHFILEINFO
+        {
+            public IntPtr hIcon;
+            public int iIcon;
+            public uint dwAttributes;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szDisplayName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)] public string szTypeName;
+        }
+
+        const uint SHGFI_ICON = 0x100;
+        const uint SHGFI_SMALLICON = 0x1;
+
+        public const int FolderImageIndex = 0;
+        public const int RdpFileImageIndex = 1;
+
+        static ImageList cached;
+
+        public static ImageList GetFolderAndRdpImageList()
+        {
+            if (cached != null) return cached;
+
+            var list = new ImageList { ImageSize = new Size(16, 16), ColorDepth = ColorDepth.Depth32Bit };
+            list.Images.Add(GetFolderIconBitmap() ?? SystemIcons.Application.ToBitmap());
+            list.Images.Add(GetRdpFileIconBitmap() ?? SystemIcons.Application.ToBitmap());
+
+            cached = list;
+            return cached;
+        }
+
+        static Bitmap GetFolderIconBitmap()
+        {
+            try
+            {
+                var shfi = new SHFILEINFO();
+                IntPtr result = SHGetFileInfo(Path.GetTempPath(), 0, ref shfi, (uint)Marshal.SizeOf(shfi), SHGFI_ICON | SHGFI_SMALLICON);
+                if (result == IntPtr.Zero || shfi.hIcon == IntPtr.Zero) return null;
+
+                try
+                {
+                    using (var icon = Icon.FromHandle(shfi.hIcon))
+                    {
+                        // ToBitmap() копіює пікселі в незалежний Bitmap -- безпечно
+                        // використовувати й після DestroyIcon нижче.
+                        return (Bitmap)icon.ToBitmap().Clone();
+                    }
+                }
+                finally
+                {
+                    DestroyIcon(shfi.hIcon);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        static Bitmap GetRdpFileIconBitmap()
+        {
+            try
+            {
+                var tempRdp = Path.Combine(Path.GetTempPath(), "RdpConsole_icon_probe.rdp");
+                if (!File.Exists(tempRdp)) File.WriteAllText(tempRdp, "");
+
+                using (var icon = Icon.ExtractAssociatedIcon(tempRdp))
+                {
+                    return icon != null ? (Bitmap)icon.ToBitmap().Clone() : null;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+    }
+
+    // Спільна побудова дерева тек/підключень (папки зверху, потім файли, за абеткою
+    // на кожному рівні) -- використовується і в головному вікні, і у вікні швидкого
+    // пошуку з трея, щоб не дублювати логіку.
+    public static class RdpTreeBuilder
+    {
+        public static void Populate(TreeView tree, List<RdpEntry> entries, Func<RdpEntry, string> formatLabel)
+        {
+            tree.BeginUpdate();
+            tree.Nodes.Clear();
+
+            var byFolder = new Dictionary<string, List<RdpEntry>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in entries)
+            {
+                var key = entry.RelativeFolder == "(корінь)" ? "" : entry.RelativeFolder;
+                List<RdpEntry> list;
+                if (!byFolder.TryGetValue(key, out list))
+                {
+                    list = new List<RdpEntry>();
+                    byFolder[key] = list;
+                }
+                list.Add(entry);
+            }
+
+            AddLevel(tree.Nodes, "", byFolder, formatLabel);
+            tree.EndUpdate();
+        }
+
+        static void AddLevel(TreeNodeCollection parentNodes, string currentPath, Dictionary<string, List<RdpEntry>> byFolder,
+            Func<RdpEntry, string> formatLabel)
+        {
+            var directSubfolders = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var key in byFolder.Keys)
+            {
+                if (key.Length == 0) continue;
+                string rel;
+                if (currentPath.Length == 0)
+                {
+                    rel = key;
+                }
+                else if (key.Length > currentPath.Length &&
+                         key.StartsWith(currentPath, StringComparison.OrdinalIgnoreCase) &&
+                         key[currentPath.Length] == '\\')
+                {
+                    rel = key.Substring(currentPath.Length + 1);
+                }
+                else
+                {
+                    continue;
+                }
+
+                var firstSegment = rel.Split('\\')[0];
+                directSubfolders.Add(currentPath.Length == 0 ? firstSegment : currentPath + "\\" + firstSegment);
+            }
+
+            foreach (var subfolderPath in directSubfolders)
+            {
+                var name = subfolderPath.Substring(subfolderPath.LastIndexOf('\\') + 1);
+                var node = new TreeNode(name)
+                {
+                    ImageIndex = ShellIcons.FolderImageIndex,
+                    SelectedImageIndex = ShellIcons.FolderImageIndex
+                };
+                parentNodes.Add(node);
+                AddLevel(node.Nodes, subfolderPath, byFolder, formatLabel);
+            }
+
+            List<RdpEntry> filesHere;
+            if (byFolder.TryGetValue(currentPath, out filesHere))
+            {
+                foreach (var entry in filesHere.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase))
+                {
+                    var text = formatLabel != null ? formatLabel(entry) : entry.DisplayName;
+                    var node = new TreeNode(text)
+                    {
+                        ImageIndex = ShellIcons.RdpFileImageIndex,
+                        SelectedImageIndex = ShellIcons.RdpFileImageIndex,
+                        Tag = entry,
+                        ToolTipText = entry.FullPath
+                    };
+                    parentNodes.Add(node);
+                }
+            }
+        }
+    }
+
     public static class Launcher
     {
         // Ці параметри відповідають чекбоксам у діалозі підтвердження RDP-з'єднання
@@ -703,7 +880,8 @@ namespace RdpConsole
                 Dock = DockStyle.Fill,
                 HideSelection = false,
                 ShowNodeToolTips = true,
-                Visible = false
+                Visible = false,
+                ImageList = ShellIcons.GetFolderAndRdpImageList()
             };
             treeView.NodeMouseDoubleClick += (s, e) =>
             {
@@ -1099,75 +1277,12 @@ namespace RdpConsole
         // (за абеткою), потім файли цього рівня (за абеткою) -- "папки зверху".
         int BuildHierarchyTree()
         {
-            treeView.BeginUpdate();
-            treeView.Nodes.Clear();
-
-            var byFolder = new Dictionary<string, List<RdpEntry>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var entry in allEntries)
+            RdpTreeBuilder.Populate(treeView, allEntries, entry =>
             {
-                var key = entry.RelativeFolder == "(корінь)" ? "" : entry.RelativeFolder;
-                List<RdpEntry> list;
-                if (!byFolder.TryGetValue(key, out list))
-                {
-                    list = new List<RdpEntry>();
-                    byFolder[key] = list;
-                }
-                list.Add(entry);
-            }
-
-            AddTreeLevel(treeView.Nodes, "", byFolder);
-
-            treeView.EndUpdate();
+                var marker = PasswordMarker(entry);
+                return marker.Length == 0 ? entry.DisplayName : entry.DisplayName + "   " + marker;
+            });
             return allEntries.Count;
-        }
-
-        void AddTreeLevel(TreeNodeCollection parentNodes, string currentPath, Dictionary<string, List<RdpEntry>> byFolder)
-        {
-            var directSubfolders = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var key in byFolder.Keys)
-            {
-                if (key.Length == 0) continue;
-                string rel;
-                if (currentPath.Length == 0)
-                {
-                    rel = key;
-                }
-                else if (key.Length > currentPath.Length &&
-                         key.StartsWith(currentPath, StringComparison.OrdinalIgnoreCase) &&
-                         key[currentPath.Length] == '\\')
-                {
-                    rel = key.Substring(currentPath.Length + 1);
-                }
-                else
-                {
-                    continue;
-                }
-
-                var firstSegment = rel.Split('\\')[0];
-                directSubfolders.Add(currentPath.Length == 0 ? firstSegment : currentPath + "\\" + firstSegment);
-            }
-
-            foreach (var subfolderPath in directSubfolders)
-            {
-                var name = subfolderPath.Substring(subfolderPath.LastIndexOf('\\') + 1);
-                var node = new TreeNode(name);
-                parentNodes.Add(node);
-                AddTreeLevel(node.Nodes, subfolderPath, byFolder);
-            }
-
-            List<RdpEntry> filesHere;
-            if (byFolder.TryGetValue(currentPath, out filesHere))
-            {
-                foreach (var entry in filesHere.OrderBy(e => e.DisplayName, StringComparer.OrdinalIgnoreCase))
-                {
-                    var marker = PasswordMarker(entry);
-                    var text = marker.Length == 0 ? entry.DisplayName : entry.DisplayName + "   " + marker;
-                    var node = new TreeNode(text);
-                    node.Tag = entry;
-                    node.ToolTipText = entry.FullPath;
-                    parentNodes.Add(node);
-                }
-            }
         }
 
         List<RdpEntry> SelectedEntries()
@@ -1434,7 +1549,12 @@ namespace RdpConsole
         Action exitAction;
 
         TextBox txtSearch;
+        Button btnViewToggle;
         ListBox lstResults;
+        TreeView treeResults;
+        bool treeMode;
+
+        const int EdgeMargin = 8;
 
         public TraySearchForm(List<RdpEntry> allEntries, AppSettings settings, IWin32Window connectOwner, Action exitAction)
         {
@@ -1442,35 +1562,24 @@ namespace RdpConsole
             this.settings = settings;
             this.connectOwner = connectOwner;
             this.exitAction = exitAction;
+            treeMode = settings.HierarchyView;
 
             AutoScaleMode = AutoScaleMode.None;
-            FormBorderStyle = FormBorderStyle.FixedToolWindow;
+            // Sizable (не Fixed) -- щоб користувач і сам міг розтягнути/звузити вікно,
+            // хоча за замовчуванням воно вже відкривається майже на всю висоту екрана.
+            FormBorderStyle = FormBorderStyle.SizableToolWindow;
             ShowInTaskbar = false;
             TopMost = true;
             Text = "Пошук підключення";
             Font = new Font("Segoe UI", 9.5f);
-            Width = 380;
-            Height = 356;
+            MinimumSize = new Size(320, 240);
             KeyPreview = true;
 
-            txtSearch = new TextBox { Left = 8, Top = 8, Width = 360 };
-            txtSearch.TextChanged += (s, e) => RefreshResults();
-            txtSearch.KeyDown += TxtSearch_KeyDown;
+            var screen = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Width = 420;
+            Height = Math.Max(MinimumSize.Height, screen.Height - 20);
 
-            lstResults = new ListBox { Left = 8, Top = 34, Width = 360, Height = 244, IntegralHeight = false };
-            lstResults.KeyDown += LstResults_KeyDown;
-            lstResults.MouseDoubleClick += (s, e) => ConnectSelected();
-
-            var btnExit = new Button { Text = "Завершити програму", Left = 8, Top = 286, Width = 150, Height = 26 };
-            btnExit.Click += (s, e) =>
-            {
-                Close();
-                if (this.exitAction != null) this.exitAction();
-            };
-
-            Controls.Add(txtSearch);
-            Controls.Add(lstResults);
-            Controls.Add(btnExit);
+            BuildUi();
 
             // Невеликий "пільговий" період після появи вікна: коли воно відкривається
             // по глобальній гарячій клавіші, перше отримання/втрата фокуса іноді
@@ -1486,9 +1595,118 @@ namespace RdpConsole
             Load += (s, e) => { shownAt = DateTime.UtcNow; txtSearch.Focus(); RefreshResults(); };
         }
 
+        void BuildUi()
+        {
+            const int toggleWidth = 100;
+            const int searchHeight = 23;
+            const int btnHeight = 26;
+            const int btnBottomMargin = 8;
+            int resultsTop = EdgeMargin + searchHeight + 6;
+            int resultsBottomReserved = btnHeight + btnBottomMargin + 6;
+
+            txtSearch = new TextBox
+            {
+                Left = EdgeMargin,
+                Top = EdgeMargin,
+                Width = ClientSize.Width - EdgeMargin * 2 - toggleWidth - 6,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            txtSearch.TextChanged += (s, e) => RefreshResults();
+            txtSearch.KeyDown += TxtSearch_KeyDown;
+
+            btnViewToggle = new Button
+            {
+                Left = ClientSize.Width - EdgeMargin - toggleWidth,
+                Top = EdgeMargin - 2,
+                Width = toggleWidth,
+                Height = searchHeight + 4,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right
+            };
+            UpdateToggleButtonText();
+            btnViewToggle.Click += (s, e) =>
+            {
+                treeMode = !treeMode;
+                settings.HierarchyView = treeMode;
+                SettingsManager.Save(settings);
+                UpdateToggleButtonText();
+                RefreshResults();
+            };
+
+            lstResults = new ListBox
+            {
+                Left = EdgeMargin,
+                Top = resultsTop,
+                Width = ClientSize.Width - EdgeMargin * 2,
+                Height = ClientSize.Height - resultsTop - resultsBottomReserved,
+                IntegralHeight = false,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
+            };
+            lstResults.KeyDown += LstResults_KeyDown;
+            lstResults.MouseDoubleClick += (s, e) => ConnectSelected();
+
+            treeResults = new TreeView
+            {
+                Left = EdgeMargin,
+                Top = resultsTop,
+                Width = ClientSize.Width - EdgeMargin * 2,
+                Height = ClientSize.Height - resultsTop - resultsBottomReserved,
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                ImageList = ShellIcons.GetFolderAndRdpImageList(),
+                ShowNodeToolTips = true,
+                Visible = false
+            };
+            treeResults.NodeMouseDoubleClick += (s, e) =>
+            {
+                treeResults.SelectedNode = e.Node;
+                if (e.Node.Tag is RdpEntry) ConnectSelected();
+            };
+            treeResults.KeyDown += TreeResults_KeyDown;
+
+            var btnExit = new Button
+            {
+                Text = "Завершити програму",
+                Left = EdgeMargin,
+                Top = ClientSize.Height - btnHeight - btnBottomMargin,
+                Width = 150,
+                Height = btnHeight,
+                Anchor = AnchorStyles.Bottom | AnchorStyles.Left
+            };
+            btnExit.Click += (s, e) =>
+            {
+                Close();
+                if (this.exitAction != null) this.exitAction();
+            };
+
+            Controls.Add(txtSearch);
+            Controls.Add(btnViewToggle);
+            Controls.Add(lstResults);
+            Controls.Add(treeResults);
+            Controls.Add(btnExit);
+        }
+
+        void UpdateToggleButtonText()
+        {
+            btnViewToggle.Text = treeMode ? "☰ Список" : "🌲 Дерево";
+        }
+
+        // Дерево (папки зверху, іконки як у провіднику) показується лише коли пошук
+        // порожній і увімкнено відповідний режим; під час активного пошуку -- завжди
+        // плаский список збігів, як і раніше.
         void RefreshResults()
         {
             var filter = txtSearch.Text.Trim();
+            bool useTree = filter.Length == 0 && treeMode;
+
+            lstResults.Visible = !useTree;
+            treeResults.Visible = useTree;
+
+            if (useTree)
+            {
+                RdpTreeBuilder.Populate(treeResults, allEntries, null);
+                if (treeResults.Nodes.Count > 0) treeResults.SelectedNode = treeResults.Nodes[0];
+                return;
+            }
+
             IEnumerable<RdpEntry> matches = allEntries;
             if (filter.Length > 0)
             {
@@ -1523,11 +1741,20 @@ namespace RdpConsole
                 e.Handled = true;
                 e.SuppressKeyPress = true;
             }
-            else if (e.KeyCode == Keys.Down && lstResults.Items.Count > 0)
+            else if (e.KeyCode == Keys.Down)
             {
-                lstResults.Focus();
-                lstResults.SelectedIndex = 0;
-                e.Handled = true;
+                if (lstResults.Visible && lstResults.Items.Count > 0)
+                {
+                    lstResults.Focus();
+                    lstResults.SelectedIndex = 0;
+                    e.Handled = true;
+                }
+                else if (treeResults.Visible && treeResults.Nodes.Count > 0)
+                {
+                    treeResults.Focus();
+                    if (treeResults.SelectedNode == null) treeResults.SelectedNode = treeResults.Nodes[0];
+                    e.Handled = true;
+                }
             }
         }
 
@@ -1545,9 +1772,28 @@ namespace RdpConsole
             }
         }
 
+        void TreeResults_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Escape)
+            {
+                Close();
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Enter)
+            {
+                var node = treeResults.SelectedNode;
+                if (node == null) return;
+                if (node.Tag is RdpEntry) ConnectSelected();
+                else node.Toggle();
+                e.Handled = true;
+            }
+        }
+
         void ConnectSelected()
         {
-            var entry = lstResults.SelectedItem as RdpEntry;
+            RdpEntry entry = treeResults.Visible
+                ? (treeResults.SelectedNode != null ? treeResults.SelectedNode.Tag as RdpEntry : null)
+                : lstResults.SelectedItem as RdpEntry;
             if (entry == null) return;
 
             Launcher.Connect(connectOwner, settings, new[] { entry });
@@ -1833,7 +2079,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.1.1";
+        public const string AppVersion = "1.2.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
