@@ -353,6 +353,40 @@ namespace RdpConsole
         }
     }
 
+    // Перевіряє, чи в Диспетчері облікових даних Windows (Панель керування -> Диспетчер
+    // облікових даних -> Облікові дані Windows) уже є збережений логін/пароль для
+    // конкретного RDP-сервера -- саме там mstsc зберігає позначку "Запам'ятати мене"
+    // під ключем "TERMSRV/<адреса>". Використовується, щоб не підставляти пароль за
+    // замовчуванням поверх уже наявних у Windows облікових даних.
+    internal static class WindowsCredentialStore
+    {
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CredRead(string target, uint type, int reservedFlag, out IntPtr credentialPtr);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern void CredFree(IntPtr cred);
+
+        const uint CRED_TYPE_GENERIC = 1;
+        const uint CRED_TYPE_DOMAIN_PASSWORD = 2;
+        const uint CRED_TYPE_DOMAIN_VISIBLE_PASSWORD = 4;
+
+        public static bool HasStoredCredential(string hostname)
+        {
+            if (string.IsNullOrEmpty(hostname)) return false;
+            var target = "TERMSRV/" + hostname;
+            foreach (var type in new[] { CRED_TYPE_DOMAIN_PASSWORD, CRED_TYPE_GENERIC, CRED_TYPE_DOMAIN_VISIBLE_PASSWORD })
+            {
+                IntPtr credPtr;
+                if (CredRead(target, type, 0, out credPtr))
+                {
+                    CredFree(credPtr);
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     // Пароль шифрується за допомогою Windows DPAPI (прив'язка до поточного облікового
     // запису Windows на цій машині) -- так само, як зберігають майстер-паролі інші
     // менеджери підключень (наприклад, mRemoteNG). Ніхто інший, ані на цьому, ані на
@@ -382,16 +416,59 @@ namespace RdpConsole
             }
         }
 
-        // Пароль конкретного підключення має пріоритет; якщо для нього нічого не
-        // збережено -- використовується пароль за замовчуванням із налаштувань (якщо є).
+        // Пріоритет: 1) власний пароль для цього підключення (у застосунку);
+        // 2) якщо власного немає, але Windows уже має збережені облікові дані для
+        // цього сервера (Диспетчер облікових даних) -- нічого не підставляємо, mstsc
+        // сам ними скористається; 3) інакше -- пароль за замовчуванням із налаштувань.
         public static string ResolveEffectivePassword(AppSettings settings, string entryFullPath)
         {
             string encrypted;
-            if (settings.EncryptedPasswords == null || !settings.EncryptedPasswords.TryGetValue(entryFullPath, out encrypted))
+            if (settings.EncryptedPasswords != null &&
+                settings.EncryptedPasswords.TryGetValue(entryFullPath, out encrypted) &&
+                !string.IsNullOrEmpty(encrypted))
             {
-                encrypted = settings.DefaultEncryptedPassword;
+                return Decrypt(encrypted);
             }
+
+            var hostname = StripPort(ExtractFullAddress(entryFullPath));
+            if (WindowsCredentialStore.HasStoredCredential(hostname))
+            {
+                return null;
+            }
+
+            encrypted = settings.DefaultEncryptedPassword;
             return string.IsNullOrEmpty(encrypted) ? null : Decrypt(encrypted);
+        }
+
+        static string ExtractFullAddress(string rdpFilePath)
+        {
+            try
+            {
+                const string prefix = "full address:s:";
+                foreach (var line in File.ReadLines(rdpFilePath))
+                {
+                    if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return line.Substring(prefix.Length).Trim();
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // Диспетчер облікових даних зберігає ціль без порту ("TERMSRV/<хост>"),
+        // тоді як "full address" у .rdp може містити "хост:порт" -- прибираємо порт.
+        static string StripPort(string address)
+        {
+            if (string.IsNullOrEmpty(address)) return address;
+            var idx = address.LastIndexOf(':');
+            if (idx > 0 && idx < address.Length - 1)
+            {
+                int port;
+                if (int.TryParse(address.Substring(idx + 1), out port)) return address.Substring(0, idx);
+            }
+            return address;
         }
     }
 
@@ -2448,7 +2525,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.3.0";
+        public const string AppVersion = "1.3.1";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
