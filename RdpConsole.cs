@@ -51,6 +51,7 @@ namespace RdpConsole
         public Color ButtonPressed;
         public Color AccentLink;
         public Color GridLines;
+        public Color ZebraStripe;
     }
 
     // Проста система тем -- Світла / Темна / Синя (за прикладом трьох тем
@@ -75,7 +76,8 @@ namespace RdpConsole
             ButtonHover = Color.FromArgb(232, 232, 232),
             ButtonPressed = Color.FromArgb(215, 215, 215),
             AccentLink = SystemColors.GrayText,
-            GridLines = Color.FromArgb(225, 225, 225)
+            GridLines = Color.FromArgb(225, 225, 225),
+            ZebraStripe = Color.FromArgb(245, 247, 250)
         };
 
         public static readonly ThemeColors Dark = new ThemeColors
@@ -91,7 +93,8 @@ namespace RdpConsole
             ButtonHover = Color.FromArgb(80, 80, 84),
             ButtonPressed = Color.FromArgb(95, 95, 100),
             AccentLink = Color.FromArgb(90, 160, 220),
-            GridLines = Color.FromArgb(60, 60, 63)
+            GridLines = Color.FromArgb(60, 60, 63),
+            ZebraStripe = Color.FromArgb(45, 45, 48)
         };
 
         public static readonly ThemeColors Blue = new ThemeColors
@@ -107,7 +110,8 @@ namespace RdpConsole
             ButtonHover = Color.FromArgb(190, 215, 240),
             ButtonPressed = Color.FromArgb(170, 200, 230),
             AccentLink = Color.FromArgb(30, 90, 160),
-            GridLines = Color.FromArgb(200, 220, 240)
+            GridLines = Color.FromArgb(200, 220, 240),
+            ZebraStripe = Color.FromArgb(212, 227, 245)
         };
 
         public static ThemeColors Get(string themeName)
@@ -195,6 +199,69 @@ namespace RdpConsole
         }
     }
 
+    // Обгортка над DWM API для фону Mica (Windows 11 22H2+). На старіших системах
+    // DwmSetWindowAttribute просто повертає код помилки (HRESULT != 0) -- ловимо це
+    // й тихо не вмикаємо ефект, застосунок далі працює зі звичайним непрозорим фоном.
+    internal static class DwmMica
+    {
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MARGINS
+        {
+            public int Left, Right, Top, Bottom;
+        }
+
+        const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+        const int DWMSBT_MAINWINDOW = 2; // Mica
+        const int DWMSBT_NONE = 1;
+
+        // Повертає true, якщо Mica увімкнено -- у цьому разі контрол(и), де має
+        // "просвічувати" фон, потрібно пофарбувати в чистий чорний (Color.Black):
+        // під час DwmExtendFrameIntoClientArea з від'ємними полями DWM трактує
+        // такі пікселі як прозорі й показує крізь них розмитий матеріал Mica.
+        public static bool TryEnable(IntPtr hwnd, bool darkTitleBar)
+        {
+            try
+            {
+                int dark = darkTitleBar ? 1 : 0;
+                DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+
+                int backdrop = DWMSBT_MAINWINDOW;
+                int hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+                if (hr != 0) return false;
+
+                var margins = new MARGINS { Left = -1, Right = -1, Top = -1, Bottom = -1 };
+                DwmExtendFrameIntoClientArea(hwnd, ref margins);
+                return true;
+            }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        // Вимикає Mica (повертає непрозорий фон) -- викликається, коли користувач
+        // знімає позначку в Налаштуваннях без перезапуску застосунку.
+        public static void Disable(IntPtr hwnd)
+        {
+            try
+            {
+                int backdrop = DWMSBT_NONE;
+                DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+                int dark = 0;
+                DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+                var margins = new MARGINS { Left = 0, Right = 0, Top = 0, Bottom = 0 };
+                DwmExtendFrameIntoClientArea(hwnd, ref margins);
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
+    }
+
     [DataContract]
     public class AppSettings
     {
@@ -207,6 +274,7 @@ namespace RdpConsole
         [DataMember] public uint HotkeyModifiers { get; set; }
         [DataMember] public uint HotkeyKey { get; set; }
         [DataMember] public string Theme { get; set; }
+        [DataMember] public bool MicaEnabled { get; set; }
 
         public static AppSettings CreateDefault()
         {
@@ -219,7 +287,8 @@ namespace RdpConsole
                 HierarchyView = true,
                 HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT,
                 HotkeyKey = HotkeyUtil.DefaultVk,
-                Theme = ThemeManager.LightThemeName
+                Theme = ThemeManager.LightThemeName,
+                MicaEnabled = false
             };
         }
     }
@@ -793,6 +862,8 @@ namespace RdpConsole
         Button btnRefresh;
         Button btnViewMode;
         Button btnRepo;
+        Panel topPanel;
+        bool micaEnabled;
         LinkLabel lnkVersion;
         ListView listView;
         TreeView treeView;
@@ -949,7 +1020,7 @@ namespace RdpConsole
 
         void BuildUi()
         {
-            var topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
+            topPanel = new Panel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(8, 8, 8, 6) };
 
             // Стиль версії/посилання на репозиторій -- як у ShadowSessionTool: маленька
             // намальована іконка-ланцюжок (а не емодзі, яке по-різному рендериться) і
@@ -988,21 +1059,21 @@ namespace RdpConsole
                 else CheckForUpdates(true);
             };
 
-            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320 };
+            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320, Margin = new Padding(0, 0, 10, 0) };
             SetPlaceholder(txtSearch, "Пошук підключення...");
             txtSearch.TextChanged += (s, e) => { ClearPlaceholderState(); ApplyFilter(); };
             txtSearch.KeyDown += TxtSearch_KeyDown;
 
-            btnRefresh = new Button { Dock = DockStyle.Right, Width = 100, Text = "Оновити (F5)" };
+            btnRefresh = new Button { Dock = DockStyle.Right, Width = 100, Text = "Оновити (F5)", Margin = new Padding(4, 0, 0, 0) };
             btnRefresh.Click += (s, e) => RescanAndFill();
 
-            btnSettings = new Button { Dock = DockStyle.Right, Width = 110, Text = "Налаштування" };
+            btnSettings = new Button { Dock = DockStyle.Right, Width = 110, Text = "Налаштування", Margin = new Padding(4, 0, 0, 0) };
             btnSettings.Click += (s, e) => OpenSettings();
 
-            btnExit = new Button { Dock = DockStyle.Right, Width = 150, Text = "Завершити програму" };
+            btnExit = new Button { Dock = DockStyle.Right, Width = 150, Text = "Завершити програму", Margin = new Padding(4, 0, 0, 0) };
             btnExit.Click += (s, e) => ExitApplication();
 
-            btnViewMode = new Button { Dock = DockStyle.Right, Width = 100 };
+            btnViewMode = new Button { Dock = DockStyle.Right, Width = 100, Margin = new Padding(4, 0, 0, 0) };
             btnViewMode.Click += (s, e) =>
             {
                 settings.HierarchyView = !settings.HierarchyView;
@@ -1095,6 +1166,51 @@ namespace RdpConsole
             lnkVersion.LinkColor = c.AccentLink;
             searchNormalColor = c.ControlFore;
             txtSearch.ForeColor = searchShowingPlaceholder ? PlaceholderColor : searchNormalColor;
+            if (IsHandleCreated) ApplyMica();
+        }
+
+        // Windows 11 Mica -- напівпрозорий розмитий фон верхньої панелі й статус-рядка
+        // (як у застосунках Параметрів). На старіших системах DwmMica.TryEnable
+        // поверне false, і форма просто лишиться зі звичайним непрозорим фоном теми.
+        void ApplyMica()
+        {
+            if (settings.MicaEnabled)
+            {
+                micaEnabled = DwmMica.TryEnable(Handle, settings.Theme == ThemeManager.DarkThemeName);
+            }
+            else if (micaEnabled)
+            {
+                DwmMica.Disable(Handle);
+                micaEnabled = false;
+            }
+
+            var c = ThemeManager.Get(settings.Theme);
+            if (micaEnabled)
+            {
+                topPanel.BackColor = Color.Black;
+                statusStrip.BackColor = Color.Black;
+                statusLabel.ForeColor = Color.FromArgb(235, 235, 235);
+                lnkVersion.BackColor = Color.Transparent;
+                lnkVersion.LinkColor = Color.FromArgb(210, 210, 210);
+                btnRepo.BackColor = Color.Transparent;
+                btnRepo.Image = CreateLinkIcon(Color.FromArgb(210, 210, 210));
+            }
+            else
+            {
+                topPanel.BackColor = c.PanelBack;
+                statusStrip.BackColor = c.PanelBack;
+                statusLabel.ForeColor = c.Foreground;
+                lnkVersion.BackColor = Color.Transparent;
+                lnkVersion.LinkColor = c.AccentLink;
+                btnRepo.BackColor = c.PanelBack;
+                btnRepo.Image = CreateLinkIcon(c.AccentLink);
+            }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ApplyMica();
         }
 
         // ---- Placeholder helper для TextBox (WinForms не має вбудованого) ----
@@ -1445,6 +1561,9 @@ namespace RdpConsole
                 item.Tag = entry;
                 item.Group = g;
                 item.ToolTipText = entry.FullPath;
+                var themeColors = ThemeManager.Get(settings.Theme);
+                item.BackColor = (shown % 2 == 1) ? themeColors.ZebraStripe : themeColors.ControlBack;
+                item.ForeColor = themeColors.ControlFore;
                 listView.Items.Add(item);
                 shown++;
             }
@@ -1867,6 +1986,17 @@ namespace RdpConsole
             ThemeManager.Apply(this, settings.Theme);
         }
 
+        // Windows 11 Mica -- вузька смужка навколо результатів пошуку (EdgeMargin)
+        // показує розмитий матеріал, якщо ефект увімкнено в Налаштуваннях.
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            if (settings.MicaEnabled && DwmMica.TryEnable(Handle, settings.Theme == ThemeManager.DarkThemeName))
+            {
+                BackColor = Color.Black;
+            }
+        }
+
         void UpdateToggleButtonText()
         {
             btnViewToggle.Text = treeMode ? "☰ Список" : "🌲 Дерево";
@@ -2055,6 +2185,7 @@ namespace RdpConsole
         RadioButton radioThemeLight;
         RadioButton radioThemeDark;
         RadioButton radioThemeBlue;
+        CheckBox chkMica;
 
         public SettingsForm(AppSettings current)
         {
@@ -2067,7 +2198,7 @@ namespace RdpConsole
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Width = 480;
-            Height = 470;
+            Height = 520;
             Font = new Font("Segoe UI", 9.5f);
 
             capturedHotkeyModifiers = working.HotkeyModifiers;
@@ -2088,6 +2219,7 @@ namespace RdpConsole
                 HotkeyModifiers = s.HotkeyModifiers,
                 HotkeyKey = s.HotkeyKey,
                 Theme = s.Theme,
+                MicaEnabled = s.MicaEnabled,
                 EncryptedPasswords = s.EncryptedPasswords != null
                     ? new Dictionary<string, string>(s.EncryptedPasswords)
                     : new Dictionary<string, string>()
@@ -2188,9 +2320,28 @@ namespace RdpConsole
             radioThemeDark.CheckedChanged += onThemePicked;
             radioThemeBlue.CheckedChanged += onThemePicked;
 
-            var btnOk = new Button { Text = "OK", Left = 280, Top = 386, Width = 85 };
+            chkMica = new CheckBox
+            {
+                Text = "Прозорий фон Mica (Windows 11, версія 22H2+)",
+                Left = 12,
+                Top = 342,
+                Width = 440,
+                Checked = working.MicaEnabled
+            };
+
+            var lblMicaHint = new Label
+            {
+                Left = 12,
+                Top = 364,
+                Width = 440,
+                Height = 32,
+                ForeColor = SystemColors.GrayText,
+                Text = "Розмитий фон верхньої панелі й статус-рядка. На старіших версіях Windows пункт просто не матиме ефекту."
+            };
+
+            var btnOk = new Button { Text = "OK", Left = 280, Top = 436, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 386, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 436, Width = 85, DialogResult = DialogResult.Cancel };
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -2212,6 +2363,8 @@ namespace RdpConsole
             Controls.Add(radioThemeLight);
             Controls.Add(radioThemeDark);
             Controls.Add(radioThemeBlue);
+            Controls.Add(chkMica);
+            Controls.Add(lblMicaHint);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
 
@@ -2286,6 +2439,7 @@ namespace RdpConsole
             working.HotkeyModifiers = capturedHotkeyModifiers;
             working.HotkeyKey = capturedHotkeyVk;
             working.Theme = SelectedThemeName();
+            working.MicaEnabled = chkMica.Checked;
             ResultSettings = working;
             DialogResult = DialogResult.OK;
             Close();
@@ -2294,7 +2448,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.2.1";
+        public const string AppVersion = "1.3.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
