@@ -37,6 +37,51 @@ namespace RdpConsole
         }
     }
 
+    // Обгортка над DWM API для фону Mica (Windows 11 22H2+). На старіших системах
+    // DwmSetWindowAttribute просто повертає код помилки (HRESULT != 0) -- ловимо це
+    // й тихо не вмикаємо ефект, застосунок далі працює зі звичайним непрозорим фоном.
+    internal static class DwmMica
+    {
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        static extern int DwmExtendFrameIntoClientArea(IntPtr hwnd, ref MARGINS margins);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MARGINS
+        {
+            public int Left, Right, Top, Bottom;
+        }
+
+        const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+        const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+        const int DWMSBT_MAINWINDOW = 2; // Mica
+
+        // Повертає true, якщо Mica увімкнено -- у цьому разі контрол(и), де має
+        // "просвічувати" фон, потрібно пофарбувати в чистий чорний (Color.Black):
+        // під час DwmExtendFrameIntoClientArea з від'ємними полями DWM трактує
+        // такі пікселі як прозорі й показує крізь них розмитий матеріал Mica.
+        public static bool TryEnable(IntPtr hwnd)
+        {
+            try
+            {
+                int dark = 0;
+                DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref dark, sizeof(int));
+
+                int backdrop = DWMSBT_MAINWINDOW;
+                int hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int));
+                if (hr != 0) return false;
+
+                var margins = new MARGINS { Left = -1, Right = -1, Top = -1, Bottom = -1 };
+                DwmExtendFrameIntoClientArea(hwnd, ref margins);
+                return true;
+            }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+    }
+
     [DataContract]
     public class AppSettings
     {
@@ -637,6 +682,9 @@ namespace RdpConsole
         StatusStrip statusStrip;
         ToolStripStatusLabel statusLabel;
         ContextMenuStrip itemMenu;
+        Panel topPanel;
+        Button btnRepo;
+        bool micaEnabled;
 
         NotifyIcon trayIcon;
         bool reallyExit;
@@ -787,12 +835,12 @@ namespace RdpConsole
 
         void BuildUi()
         {
-            var topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
+            topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
 
             // Стиль версії/посилання на репозиторій -- як у ShadowSessionTool: маленька
             // намальована іконка-ланцюжок (а не емодзі, яке по-різному рендериться) і
             // підкреслений текст версії, що виглядає як гіперпосилання.
-            var btnRepo = new Button
+            btnRepo = new Button
             {
                 Dock = DockStyle.Left,
                 Width = 26,
@@ -1541,6 +1589,28 @@ namespace RdpConsole
             }
             base.WndProc(ref m);
         }
+
+        // Windows 11 Mica -- напівпрозорий розмитий фон вікна (як у застосунках
+        // Параметрів). На старіших системах TryEnable поверне false і форма
+        // просто залишиться зі звичайним непрозорим фоном.
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            micaEnabled = DwmMica.TryEnable(Handle);
+            if (micaEnabled)
+            {
+                // Чистий чорний -- "прозорий" для DWM під час sheet-of-glass розширення;
+                // саме верхня панель і статус-рядок показують ефект Mica, список
+                // підключень лишається непрозорим (звичайний фон) для читабельності.
+                topPanel.BackColor = Color.Black;
+                statusStrip.BackColor = Color.Black;
+                statusLabel.ForeColor = Color.FromArgb(235, 235, 235);
+                lnkVersion.BackColor = Color.Transparent;
+                lnkVersion.LinkColor = Color.FromArgb(210, 210, 210);
+                btnRepo.BackColor = Color.Transparent;
+                btnRepo.Image = CreateLinkIcon(Color.FromArgb(210, 210, 210));
+            }
+        }
     }
 
     // Легке спливаюче вікно швидкого пошуку, яке відкривається з трею (правий
@@ -1560,6 +1630,14 @@ namespace RdpConsole
         bool treeMode;
 
         const int EdgeMargin = 8;
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // Чистий чорний фон форми -- "прозорий" для DWM Mica; вузька смужка
+            // навколо результатів пошуку (EdgeMargin) показує розмитий матеріал.
+            if (DwmMica.TryEnable(Handle)) BackColor = Color.Black;
+        }
 
         public TraySearchForm(List<RdpEntry> allEntries, AppSettings settings, IWin32Window connectOwner, Action exitAction)
         {
