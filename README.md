@@ -9,6 +9,15 @@
 один файл `.cs`, компільований вбудованим у Windows компілятором `csc.exe`
 (з .NET Framework), без потреби встановлювати .NET SDK чи Visual Studio.
 
+## Скриншоти
+
+Головне вікно (ієрархічний перегляд) і вікно швидкого пошуку з трея:
+
+<p>
+  <img src="screenshots/main-window.png" alt="Головне вікно RDP Console" width="600"><br>
+  <img src="screenshots/quick-search.png" alt="Швидкий пошук з трея" width="300">
+</p>
+
 ## Можливості
 
 - Рекурсивне сканування вказаної папки на файли `*.rdp`.
