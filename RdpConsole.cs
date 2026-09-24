@@ -15,6 +15,26 @@ using System.Windows.Forms;
 
 namespace RdpConsole
 {
+    // Легкий візуальний рефреш: плоскі кнопки з тонкою рамкою й підсвіткою при наведенні
+    // замість типового об'ємного вигляду Windows-кнопок за замовчуванням.
+    public static class UiStyle
+    {
+        public static readonly Color ButtonBorder = Color.FromArgb(200, 200, 200);
+        public static readonly Color ButtonHover = Color.FromArgb(232, 232, 232);
+        public static readonly Color ButtonPressed = Color.FromArgb(215, 215, 215);
+        public static readonly Color ZebraStripe = Color.FromArgb(245, 247, 250);
+
+        public static void Flatify(this Button b)
+        {
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderColor = ButtonBorder;
+            b.FlatAppearance.BorderSize = 1;
+            b.FlatAppearance.MouseOverBackColor = ButtonHover;
+            b.FlatAppearance.MouseDownBackColor = ButtonPressed;
+            b.Cursor = Cursors.Hand;
+        }
+    }
+
     // Спільні константи й форматування для глобальної гарячої клавіші -- використовуються
     // і в налаштуваннях за замовчуванням (AppSettings), і в реєстрації (MainForm),
     // і в діалозі вибору комбінації (SettingsForm), щоб не дублювати значення.
@@ -787,7 +807,7 @@ namespace RdpConsole
 
         void BuildUi()
         {
-            var topPanel = new Panel { Dock = DockStyle.Top, Height = 36, Padding = new Padding(6, 5, 6, 3) };
+            var topPanel = new Panel { Dock = DockStyle.Top, Height = 44, Padding = new Padding(8, 8, 8, 6) };
 
             // Стиль версії/посилання на репозиторій -- як у ShadowSessionTool: маленька
             // намальована іконка-ланцюжок (а не емодзі, яке по-різному рендериться) і
@@ -825,27 +845,31 @@ namespace RdpConsole
                 else CheckForUpdates(true);
             };
 
-            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320 };
+            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320, Margin = new Padding(0, 0, 10, 0) };
             SetPlaceholder(txtSearch, "Пошук підключення...");
             txtSearch.TextChanged += (s, e) => { ClearPlaceholderState(); ApplyFilter(); };
             txtSearch.KeyDown += TxtSearch_KeyDown;
 
-            btnRefresh = new Button { Dock = DockStyle.Right, Width = 100, Text = "Оновити (F5)" };
+            btnRefresh = new Button { Dock = DockStyle.Right, Width = 100, Text = "Оновити (F5)", Margin = new Padding(4, 0, 0, 0) };
             btnRefresh.Click += (s, e) => RescanAndFill();
+            btnRefresh.Flatify();
 
-            btnSettings = new Button { Dock = DockStyle.Right, Width = 110, Text = "Налаштування" };
+            btnSettings = new Button { Dock = DockStyle.Right, Width = 110, Text = "Налаштування", Margin = new Padding(4, 0, 0, 0) };
             btnSettings.Click += (s, e) => OpenSettings();
+            btnSettings.Flatify();
 
-            btnExit = new Button { Dock = DockStyle.Right, Width = 150, Text = "Завершити програму" };
+            btnExit = new Button { Dock = DockStyle.Right, Width = 150, Text = "Завершити програму", Margin = new Padding(4, 0, 0, 0) };
             btnExit.Click += (s, e) => ExitApplication();
+            btnExit.Flatify();
 
-            btnViewMode = new Button { Dock = DockStyle.Right, Width = 100 };
+            btnViewMode = new Button { Dock = DockStyle.Right, Width = 100, Margin = new Padding(4, 0, 0, 0) };
             btnViewMode.Click += (s, e) =>
             {
                 settings.HierarchyView = !settings.HierarchyView;
                 SettingsManager.Save(settings);
                 ApplyFilter();
             };
+            btnViewMode.Flatify();
 
             topPanel.Controls.Add(txtSearch);
             topPanel.Controls.Add(lnkVersion);
@@ -1270,6 +1294,7 @@ namespace RdpConsole
                 item.Tag = entry;
                 item.Group = g;
                 item.ToolTipText = entry.FullPath;
+                item.BackColor = (shown % 2 == 1) ? UiStyle.ZebraStripe : Color.White;
                 listView.Items.Add(item);
                 shown++;
             }
@@ -1627,6 +1652,7 @@ namespace RdpConsole
                 Height = searchHeight + 4,
                 Anchor = AnchorStyles.Top | AnchorStyles.Right
             };
+            btnViewToggle.Flatify();
             UpdateToggleButtonText();
             btnViewToggle.Click += (s, e) =>
             {
@@ -1676,6 +1702,7 @@ namespace RdpConsole
                 Height = btnHeight,
                 Anchor = AnchorStyles.Bottom | AnchorStyles.Left
             };
+            btnExit.Flatify();
             btnExit.Click += (s, e) =>
             {
                 Close();
@@ -1832,8 +1859,10 @@ namespace RdpConsole
             chkShow.CheckedChanged += (s, e) => txtPassword.UseSystemPasswordChar = !chkShow.Checked;
 
             var btnOk = new Button { Text = "Зберегти", Left = 172, Top = 96, Width = 85 };
+            btnOk.Flatify();
             btnOk.Click += (s, e) => Accept();
             var btnCancel = new Button { Text = "Скасувати", Left = 264, Top = 96, Width = 85, DialogResult = DialogResult.Cancel };
+            btnCancel.Flatify();
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -1915,6 +1944,7 @@ namespace RdpConsole
             var lblRoot = new Label { Text = "Папка з файлами *.rdp:", Left = 12, Top = 14, Width = 300 };
             txtRoot = new TextBox { Left = 12, Top = 36, Width = 340, Text = working.RootFolder };
             var btnBrowse = new Button { Text = "Огляд...", Left = 360, Top = 34, Width = 90 };
+            btnBrowse.Flatify();
             btnBrowse.Click += (s, e) =>
             {
                 using (var fbd = new FolderBrowserDialog { SelectedPath = SafeDir(txtRoot.Text) })
@@ -1967,6 +1997,7 @@ namespace RdpConsole
             txtHotkey.KeyDown += TxtHotkey_KeyDown;
 
             var btnResetHotkey = new Button { Text = "Типова", Left = 268, Top = 218, Width = 80 };
+            btnResetHotkey.Flatify();
             btnResetHotkey.Click += (s, e) =>
             {
                 capturedHotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
@@ -1975,6 +2006,7 @@ namespace RdpConsole
             };
 
             var btnClearHotkey = new Button { Text = "Вимкнути", Left = 352, Top = 218, Width = 80 };
+            btnClearHotkey.Flatify();
             btnClearHotkey.Click += (s, e) =>
             {
                 capturedHotkeyModifiers = 0;
@@ -1993,8 +2025,10 @@ namespace RdpConsole
             };
 
             var btnOk = new Button { Text = "OK", Left = 280, Top = 336, Width = 85 };
+            btnOk.Flatify();
             btnOk.Click += (s, e) => Accept();
             var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 336, Width = 85, DialogResult = DialogResult.Cancel };
+            btnCancel.Flatify();
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
