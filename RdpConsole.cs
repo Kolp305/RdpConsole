@@ -531,6 +531,92 @@ namespace RdpConsole
         }
     }
 
+    // Читання/запис адреси комп'ютера ("full address") і користувача ("username") в
+    // оригінальному .rdp-файлі. Кодування файлу зберігається як було (mstsc зазвичай
+    // пише UTF-16 з BOM, інші редактори -- UTF-8), решта рядків лишається без змін.
+    public static class RdpFileEditor
+    {
+        const string AddressPrefix = "full address:s:";
+        const string UserPrefix = "username:s:";
+
+        static Encoding DetectEncoding(byte[] bytes)
+        {
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return new UTF8Encoding(true);
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) return new UnicodeEncoding(false, true);
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) return new UnicodeEncoding(true, true);
+            try
+            {
+                new UTF8Encoding(false, true).GetString(bytes);
+                return new UTF8Encoding(false);
+            }
+            catch (DecoderFallbackException)
+            {
+                return Encoding.Default;
+            }
+        }
+
+        static List<string> ReadLines(string path, out Encoding encoding)
+        {
+            var bytes = File.ReadAllBytes(path);
+            encoding = DetectEncoding(bytes);
+            string text;
+            using (var sr = new StreamReader(new MemoryStream(bytes), encoding, true))
+            {
+                text = sr.ReadToEnd();
+            }
+            var lines = text.Replace("\r\n", "\n").Split('\n').ToList();
+            if (lines.Count > 0 && lines[lines.Count - 1].Length == 0) lines.RemoveAt(lines.Count - 1);
+            return lines;
+        }
+
+        public static void Read(string path, out string address, out string user)
+        {
+            Encoding enc;
+            address = "";
+            user = "";
+            foreach (var line in ReadLines(path, out enc))
+            {
+                if (line.StartsWith(AddressPrefix, StringComparison.OrdinalIgnoreCase)) address = line.Substring(AddressPrefix.Length).Trim();
+                else if (line.StartsWith(UserPrefix, StringComparison.OrdinalIgnoreCase)) user = line.Substring(UserPrefix.Length).Trim();
+            }
+        }
+
+        public static void Save(string path, string address, string user)
+        {
+            Encoding enc;
+            var lines = ReadLines(path, out enc);
+            SetValue(lines, AddressPrefix, address);
+            SetValue(lines, UserPrefix, user);
+            File.WriteAllText(path, string.Join("\r\n", lines) + "\r\n", enc);
+        }
+
+        // Порожнє значення прибирає рядок (напр. "username:s:" без імені -- те саме, що
+        // його відсутність); непорожнє -- замінює перший збіг, дублікати видаляє.
+        static void SetValue(List<string> lines, string prefix, string value)
+        {
+            int first = -1;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (!lines[i].StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+                if (first < 0) first = i;
+                else { lines.RemoveAt(i); i--; }
+            }
+
+            if (string.IsNullOrEmpty(value))
+            {
+                if (first >= 0) lines.RemoveAt(first);
+            }
+            else if (first >= 0)
+            {
+                lines[first] = prefix + value;
+            }
+            else
+            {
+                lines.Add(prefix + value);
+            }
+        }
+    }
+
     // Реальні іконки папки та .rdp-файлу з провідника Windows (той самий API, яким
     // користується сам Explorer) -- виглядають так само, як у файловому менеджері,
     // на відміну від будь-якого самостійно намальованого чи emoji-замінника.
@@ -1790,6 +1876,12 @@ namespace RdpConsole
                 var t = targets[0];
                 bool hasOwnPwd = HasOwnPassword(t);
 
+                var miConn = new ToolStripMenuItem("Комп'ютер / користувач...");
+                miConn.Click += (s, ev) => ConnectionEditor.Edit(this, t, settings.Theme);
+                itemMenu.Items.Add(miConn);
+
+                itemMenu.Items.Add(new ToolStripSeparator());
+
                 var miPwd = new ToolStripMenuItem(hasOwnPwd ? "Змінити пароль..." : "Зберегти пароль...");
                 miPwd.Click += (s, ev) => SavePasswordFor(t);
                 itemMenu.Items.Add(miPwd);
@@ -1930,6 +2022,10 @@ namespace RdpConsole
         ListBox lstResults;
         TreeView treeResults;
         bool treeMode;
+        ContextMenuStrip resultMenu;
+        // Поки відкрито контекстне меню або діалог редагування, вікно втрачає фокус --
+        // це не привід закривати його (інакше воно зникне разом із діалогом).
+        bool suppressClose;
 
         const int EdgeMargin = 8;
 
@@ -1967,6 +2063,7 @@ namespace RdpConsole
             Deactivate += (s, e) =>
             {
                 if ((DateTime.UtcNow - shownAt).TotalMilliseconds < 300) return;
+                if (suppressClose) return;
                 Close();
             };
             Load += (s, e) => { shownAt = DateTime.UtcNow; txtSearch.Focus(); RefreshResults(); };
@@ -2038,6 +2135,25 @@ namespace RdpConsole
                 if (e.Node.Tag is RdpEntry) ConnectSelected();
             };
             treeResults.KeyDown += TreeResults_KeyDown;
+
+            resultMenu = new ContextMenuStrip();
+            resultMenu.Opening += ResultMenu_Opening;
+            resultMenu.Closed += ResultMenu_Closed;
+            lstResults.ContextMenuStrip = resultMenu;
+            treeResults.ContextMenuStrip = resultMenu;
+            // Правий клік має спершу виділити елемент під курсором -- меню з'являється
+            // на відпусканні кнопки, тож до цього моменту виділення вже змінене.
+            lstResults.MouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right) return;
+                int i = lstResults.IndexFromPoint(e.Location);
+                lstResults.SelectedIndex = i;
+            };
+            treeResults.MouseDown += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right) return;
+                treeResults.SelectedNode = treeResults.GetNodeAt(e.Location);
+            };
 
             var btnExit = new Button
             {
@@ -2179,15 +2295,62 @@ namespace RdpConsole
             }
         }
 
-        void ConnectSelected()
+        RdpEntry SelectedEntry()
         {
-            RdpEntry entry = treeResults.Visible
+            return treeResults.Visible
                 ? (treeResults.SelectedNode != null ? treeResults.SelectedNode.Tag as RdpEntry : null)
                 : lstResults.SelectedItem as RdpEntry;
+        }
+
+        void ConnectSelected()
+        {
+            var entry = SelectedEntry();
             if (entry == null) return;
 
             Launcher.Connect(connectOwner, settings, new[] { entry });
             Close();
+        }
+
+        void ResultMenu_Opening(object sender, System.ComponentModel.CancelEventArgs e)
+        {
+            var entry = SelectedEntry();
+            resultMenu.Items.Clear();
+            if (entry == null)
+            {
+                e.Cancel = true;
+                return;
+            }
+
+            suppressClose = true;
+
+            var miConnect = new ToolStripMenuItem("Підключитися");
+            miConnect.Font = new Font(resultMenu.Font, FontStyle.Bold);
+            miConnect.Click += (s, ev) => ConnectSelected();
+            resultMenu.Items.Add(miConnect);
+
+            var miEdit = new ToolStripMenuItem("Комп'ютер / користувач...");
+            miEdit.Click += (s, ev) =>
+            {
+                suppressClose = true;
+                try { ConnectionEditor.Edit(this, entry, settings.Theme); }
+                finally { suppressClose = false; }
+            };
+            resultMenu.Items.Add(miEdit);
+        }
+
+        // Закрите меню (вибір пункту, Esc або клік повз нього) знову вмикає звичайну
+        // поведінку "закритися при втраті фокуса"; якщо вікно після кліку повз меню
+        // вже не активне -- закриваємо його, як зробив би Deactivate.
+        void ResultMenu_Closed(object sender, ToolStripDropDownClosedEventArgs e)
+        {
+            BeginInvoke(new Action(() =>
+            {
+                suppressClose = false;
+                if (!IsDisposed && Form.ActiveForm == null && e.CloseReason != ToolStripDropDownCloseReason.ItemClicked)
+                {
+                    Close();
+                }
+            }));
         }
     }
 
@@ -2244,6 +2407,103 @@ namespace RdpConsole
             Password = txtPassword.Text;
             DialogResult = DialogResult.OK;
             Close();
+        }
+    }
+
+    // Діалог перегляду/зміни імені комп'ютера й користувача підключення -- ті самі
+    // поля, що в стандартному вікні mstsc ("Комп'ютер" / "Користувач").
+    public class ConnectionEditDialog : Form
+    {
+        public string Address;
+        public string User;
+
+        TextBox txtAddress;
+        TextBox txtUser;
+
+        public ConnectionEditDialog(string forName, string address, string user, string themeName)
+        {
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "Підключення \"" + forName + "\"";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            Width = 380;
+            Height = 215;
+            Font = new Font("Segoe UI", 9.5f);
+
+            var lblAddress = new Label { Text = "Комп'ютер:", Left = 12, Top = 16, Width = 340 };
+            txtAddress = new TextBox { Left = 12, Top = 38, Width = 340, Text = address };
+
+            var lblUser = new Label { Text = "Користувач:", Left = 12, Top = 70, Width = 340 };
+            txtUser = new TextBox { Left = 12, Top = 92, Width = 340, Text = user };
+
+            var btnOk = new Button { Text = "Зберегти", Left = 172, Top = 128, Width = 85 };
+            btnOk.Click += (s, e) => Accept();
+            var btnCancel = new Button { Text = "Скасувати", Left = 264, Top = 128, Width = 85, DialogResult = DialogResult.Cancel };
+
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            Controls.Add(lblAddress);
+            Controls.Add(txtAddress);
+            Controls.Add(lblUser);
+            Controls.Add(txtUser);
+            Controls.Add(btnOk);
+            Controls.Add(btnCancel);
+
+            ThemeManager.Apply(this, themeName);
+
+            Load += (s, e) => { txtAddress.Focus(); txtAddress.SelectAll(); };
+        }
+
+        void Accept()
+        {
+            var address = txtAddress.Text.Trim();
+            if (address.Length == 0)
+            {
+                MessageBox.Show(this, "Вкажіть ім'я або адресу комп'ютера.", "Перевірка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            Address = address;
+            User = txtUser.Text.Trim();
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+    }
+
+    // Спільна логіка для головного вікна й вікна швидкого пошуку: прочитати значення
+    // з файлу, показати діалог і записати зміни назад в оригінальний .rdp.
+    public static class ConnectionEditor
+    {
+        public static void Edit(IWin32Window owner, RdpEntry entry, string themeName)
+        {
+            string address, user;
+            try
+            {
+                RdpFileEditor.Read(entry.FullPath, out address, out user);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(owner, "Не вдалося прочитати файл:\n" + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            using (var dlg = new ConnectionEditDialog(entry.DisplayName, address, user, themeName))
+            {
+                if (dlg.ShowDialog(owner) != DialogResult.OK) return;
+                if (dlg.Address == address && dlg.User == user) return;
+
+                try
+                {
+                    RdpFileEditor.Save(entry.FullPath, dlg.Address, dlg.User);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(owner, "Не вдалося зберегти файл:\n" + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
         }
     }
 
@@ -2525,7 +2785,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.3.1";
+        public const string AppVersion = "1.4.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
