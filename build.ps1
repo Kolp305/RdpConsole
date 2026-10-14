@@ -21,7 +21,7 @@ try {
         /out:RdpConsole.exe `
         /win32manifest:app.manifest `
         /win32icon:RdpConsole.ico `
-        /reference:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Runtime.Serialization.dll,System.Security.dll `
+        /reference:System.dll,System.Core.dll,System.Windows.Forms.dll,System.Drawing.dll,System.Runtime.Serialization.dll,System.Security.dll,Microsoft.VisualBasic.dll `
         RdpConsole.cs
 
     if ($LASTEXITCODE -eq 0) {
