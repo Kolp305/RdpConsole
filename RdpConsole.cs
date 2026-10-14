@@ -1096,6 +1096,31 @@ namespace RdpConsole
                 .ToList();
         }
 
+        // Усі підпапки кореня (разом із порожніми) -- відносні шляхи, для вибору папки
+        // у діалозі нового підключення.
+        public static List<string> ListFolders(string root)
+        {
+            var result = new List<string>();
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) return result;
+            CollectFolders(root.TrimEnd('\\', '/'), "", result);
+            result.Sort(StringComparer.OrdinalIgnoreCase);
+            return result;
+        }
+
+        static void CollectFolders(string dir, string relative, List<string> results)
+        {
+            string[] subdirs;
+            try { subdirs = Directory.GetDirectories(dir); }
+            catch { return; }
+
+            foreach (var sd in subdirs)
+            {
+                var rel = relative.Length == 0 ? Path.GetFileName(sd) : relative + "\\" + Path.GetFileName(sd);
+                results.Add(rel);
+                CollectFolders(sd, rel, results);
+            }
+        }
+
         static void CollectFiles(string dir, List<string> results)
         {
             string[] files;
@@ -1171,6 +1196,23 @@ namespace RdpConsole
             SetValue(lines, AddressPrefix, address);
             SetValue(lines, UserPrefix, user);
             File.WriteAllText(path, string.Join("\r\n", lines) + "\r\n", enc);
+        }
+
+        // Новий .rdp у тому ж форматі, що пише сам mstsc (UTF-16 з BOM). Параметри
+        // перенаправлення (буфер обміну тощо) Launcher додає під час підключення.
+        public static void Create(string path, string address, string user)
+        {
+            var lines = new List<string>
+            {
+                "screen mode id:i:2",
+                "use multimon:i:0",
+                "session bpp:i:32",
+                "authentication level:i:2",
+                "prompt for credentials:i:0"
+            };
+            SetValue(lines, AddressPrefix, address);
+            SetValue(lines, UserPrefix, user);
+            File.WriteAllText(path, string.Join("\r\n", lines) + "\r\n", new UnicodeEncoding(false, true));
         }
 
         // Порожнє значення прибирає рядок (напр. "username:s:" без імені -- те саме, що
@@ -1905,7 +1947,7 @@ namespace RdpConsole
 
         // Зміна спільних налаштувань: спершу підтягуємо свіжу версію файлу (щоб не затерти
         // зміни, зроблені на іншому ПК), потім застосовуємо зміну й зберігаємо.
-        static void Change(AppSettings s, Action change, Action onChanged)
+        public static void Change(AppSettings s, Action change, Action onChanged)
         {
             SettingsManager.ReloadShared(s, true);
             change();
@@ -1925,6 +1967,7 @@ namespace RdpConsole
         Button btnRefresh;
         Button btnViewMode;
         Button btnRepo;
+        Button btnNew;
         Panel topPanel;
         bool micaEnabled;
         LinkLabel lnkVersion;
@@ -2049,7 +2092,12 @@ namespace RdpConsole
         {
             RefreshIfSharedSettingsChanged();
             var form = new TraySearchForm(allEntries, settings, this, () => ExitApplication());
-            form.FormClosed += (s, e) => { if (form.PasswordsChanged && !IsDisposed) ApplyFilter(); };
+            form.FormClosed += (s, e) =>
+            {
+                if (IsDisposed) return;
+                if (form.NewConnectionCreated) RescanAndFill();
+                else if (form.PasswordsChanged) ApplyFilter();
+            };
 
             var screen = Screen.FromPoint(Cursor.Position).WorkingArea;
             int x = Math.Min(Cursor.Position.X, screen.Right - form.Width - 4);
@@ -2178,10 +2226,14 @@ namespace RdpConsole
                 else CheckForUpdates(true);
             };
 
-            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 320, Margin = new Padding(0, 0, 10, 0) };
+            txtSearch = new TextBox { Dock = DockStyle.Left, Width = 250, Margin = new Padding(0, 0, 10, 0) };
             SetPlaceholder(txtSearch, "Пошук підключення...");
             txtSearch.TextChanged += (s, e) => { ClearPlaceholderState(); ApplyFilter(); };
             txtSearch.KeyDown += TxtSearch_KeyDown;
+
+            btnNew = new Button { Dock = DockStyle.Right, Width = 80, Text = "+ Нове", Margin = new Padding(4, 0, 0, 0) };
+            btnNew.Click += (s, e) => CreateNewConnection(CurrentFolderKey());
+            new ToolTip().SetToolTip(btnNew, "Створити нове підключення (Ctrl+N)");
 
             btnRefresh = new Button { Dock = DockStyle.Right, Width = 100, Text = "Оновити (F5)", Margin = new Padding(4, 0, 0, 0) };
             btnRefresh.Click += (s, e) => RescanAndFill();
@@ -2198,6 +2250,7 @@ namespace RdpConsole
             topPanel.Controls.Add(txtSearch);
             topPanel.Controls.Add(lnkVersion);
             topPanel.Controls.Add(btnRepo);
+            topPanel.Controls.Add(btnNew);
             topPanel.Controls.Add(btnExit);
             topPanel.Controls.Add(btnSettings);
             topPanel.Controls.Add(btnRefresh);
@@ -2247,6 +2300,12 @@ namespace RdpConsole
                 if (e.Button != MouseButtons.Right) return;
                 treeView.SelectedNode = e.Node;
                 if (e.Node.Tag is RdpEntry || e.Node.Tag is RdpFolder) itemMenu.Show(treeView, e.Location);
+            };
+            treeView.MouseUp += (s, e) =>
+            {
+                if (e.Button != MouseButtons.Right || treeView.GetNodeAt(e.Location) != null) return;
+                treeView.SelectedNode = null;
+                ShowNewOnlyMenu(treeView, e.Location);
             };
             treeView.KeyDown += (s, e) =>
             {
@@ -2727,6 +2786,81 @@ namespace RdpConsole
             Launcher.Connect(this, settings, targets);
         }
 
+        // Папка виділеного елемента (для папки в дереві -- вона сама); "" -- корінь.
+        string CurrentFolderKey()
+        {
+            if (treeView.Visible && treeView.SelectedNode != null)
+            {
+                var folder = treeView.SelectedNode.Tag as RdpFolder;
+                if (folder != null) return folder.RelativePath;
+            }
+            var entries = SelectedEntries();
+            return entries.Count > 0 ? entries[0].FolderKey : "";
+        }
+
+        void CreateNewConnection(string folderKey)
+        {
+            bool connectNow;
+            var created = NewConnectionCreator.Create(this, settings, folderKey, out connectNow);
+            if (created == null) return;
+
+            RescanAndFill();
+            var entry = allEntries.FirstOrDefault(x => string.Equals(x.RelativePath, created.RelativePath, StringComparison.OrdinalIgnoreCase));
+            if (entry == null) return;
+
+            SelectEntry(entry);
+            if (connectNow) Launcher.Connect(this, settings, new[] { entry });
+        }
+
+        // Виділяє щойно створений запис у дереві чи списку (якщо його не відфільтровано).
+        void SelectEntry(RdpEntry entry)
+        {
+            if (treeView.Visible)
+            {
+                var node = FindNode(treeView.Nodes, entry.RelativePath);
+                if (node == null) return;
+                treeView.SelectedNode = node;
+                node.EnsureVisible();
+                treeView.Focus();
+                return;
+            }
+
+            foreach (ListViewItem it in listView.Items)
+            {
+                var e = it.Tag as RdpEntry;
+                if (e == null || !string.Equals(e.RelativePath, entry.RelativePath, StringComparison.OrdinalIgnoreCase)) continue;
+                listView.SelectedItems.Clear();
+                it.Selected = true;
+                it.Focused = true;
+                it.EnsureVisible();
+                listView.Focus();
+                return;
+            }
+        }
+
+        static TreeNode FindNode(TreeNodeCollection nodes, string relativePath)
+        {
+            foreach (TreeNode n in nodes)
+            {
+                var e = n.Tag as RdpEntry;
+                if (e != null && string.Equals(e.RelativePath, relativePath, StringComparison.OrdinalIgnoreCase)) return n;
+                var found = FindNode(n.Nodes, relativePath);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        // ПКМ на порожньому місці списку -- лише створення підключення.
+        void ShowNewOnlyMenu(Control owner, Point location)
+        {
+            var menu = new ContextMenuStrip();
+            var mi = new ToolStripMenuItem("Нове підключення...");
+            mi.Click += (s, e) => CreateNewConnection(CurrentFolderKey());
+            menu.Items.Add(mi);
+            menu.Closed += (s, e) => BeginInvoke(new Action(menu.Dispose));
+            menu.Show(owner, location);
+        }
+
         void ListView_MouseDoubleClick(object sender, MouseEventArgs e)
         {
             var hit = listView.GetItemAt(e.X, e.Y);
@@ -2748,6 +2882,11 @@ namespace RdpConsole
             if (hit != null)
             {
                 itemMenu.Show(listView, e.Location);
+            }
+            else
+            {
+                listView.SelectedItems.Clear();
+                ShowNewOnlyMenu(listView, e.Location);
             }
         }
 
@@ -2805,6 +2944,11 @@ namespace RdpConsole
                 RescanAndFill();
                 e.Handled = true;
             }
+            else if (e.KeyCode == Keys.N && e.Control && !e.Alt && !e.Shift)
+            {
+                CreateNewConnection(CurrentFolderKey());
+                e.Handled = true;
+            }
         }
 
         void ItemMenu_Opening(object sender, System.ComponentModel.CancelEventArgs e)
@@ -2815,6 +2959,11 @@ namespace RdpConsole
             var folder = treeView.Visible && treeView.SelectedNode != null ? treeView.SelectedNode.Tag as RdpFolder : null;
             if (folder != null)
             {
+                var miNewHere = new ToolStripMenuItem("Нове підключення в цій папці...");
+                miNewHere.Click += (s, ev) => CreateNewConnection(folder.RelativePath);
+                itemMenu.Items.Add(miNewHere);
+                itemMenu.Items.Add(new ToolStripSeparator());
+
                 PasswordMenu.AddFolderItems(itemMenu.Items, this, settings, folder.RelativePath, false, a => a(), ApplyFilter);
                 PasswordMenu.AddFolderSearchItem(itemMenu.Items, settings, folder.RelativePath, ApplyFilter);
                 return;
@@ -2845,6 +2994,10 @@ namespace RdpConsole
                     RescanAndFill();
                 };
                 itemMenu.Items.Add(miConn);
+
+                var miNew = new ToolStripMenuItem("Нове підключення в цій папці...");
+                miNew.Click += (s, ev) => CreateNewConnection(t.FolderKey);
+                itemMenu.Items.Add(miNew);
 
                 itemMenu.Items.Add(new ToolStripSeparator());
 
@@ -2993,6 +3146,7 @@ namespace RdpConsole
 
         // Паролі змінено з цього вікна -- головне вікно оновить свій список після закриття.
         public bool PasswordsChanged { get; private set; }
+        public bool NewConnectionCreated { get; private set; }
 
         const int EdgeMargin = 8;
 
@@ -3297,6 +3451,11 @@ namespace RdpConsole
             if (folder != null)
             {
                 suppressClose = true;
+                var miNewHere = new ToolStripMenuItem("Нове підключення в цій папці...");
+                miNewHere.Click += (s, ev) => CreateNew(folder.RelativePath);
+                resultMenu.Items.Add(miNewHere);
+                resultMenu.Items.Add(new ToolStripSeparator());
+
                 PasswordMenu.AddFolderItems(resultMenu.Items, this, settings, folder.RelativePath, false, RunModal, OnPasswordsChanged);
                 PasswordMenu.AddFolderSearchItem(resultMenu.Items, settings, folder.RelativePath, OnPasswordsChanged);
                 return;
@@ -3324,8 +3483,34 @@ namespace RdpConsole
             };
             resultMenu.Items.Add(miEdit);
 
+            var miNew = new ToolStripMenuItem("Нове підключення в цій папці...");
+            miNew.Click += (s, ev) => CreateNew(entry.FolderKey);
+            resultMenu.Items.Add(miNew);
+
             resultMenu.Items.Add(new ToolStripSeparator());
             PasswordMenu.AddEntryItems(resultMenu.Items, this, settings, entry, RunModal, OnPasswordsChanged);
+        }
+
+        // allEntries -- той самий список, що й у головного вікна, тож новий запис одразу
+        // видно в обох; головне вікно після закриття цього перескановує папку (порядок).
+        void CreateNew(string folderKey)
+        {
+            RunModal(() =>
+            {
+                bool connectNow;
+                var created = NewConnectionCreator.Create(this, settings, folderKey, out connectNow);
+                if (created == null) return;
+
+                allEntries.Add(created);
+                NewConnectionCreated = true;
+                RefreshResults();
+
+                if (connectNow)
+                {
+                    Launcher.Connect(connectOwner, settings, new[] { created });
+                    Close();
+                }
+            });
         }
 
         // Діалог із меню забирає фокус -- на цей час вимикаємо автозакриття вікна.
@@ -3557,6 +3742,224 @@ namespace RdpConsole
                 {
                     MessageBox.Show(owner, "Не вдалося зберегти файл:\n" + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
+            }
+        }
+    }
+
+    // Діалог створення нового підключення: назва файлу, папка (існуюча або нова
+    // підпапка), комп'ютер, користувач і, за бажанням, пароль підключення.
+    public class NewConnectionDialog : Form
+    {
+        const string RootLabel = "(корінь)";
+
+        public string FileName;
+        public string FolderKey = "";
+        public string FullPath;
+        public string Address;
+        public string User;
+        public string Password;
+        public bool ConnectNow;
+
+        readonly string root;
+        TextBox txtName;
+        ComboBox cmbFolder;
+        TextBox txtAddress;
+        TextBox txtUser;
+        TextBox txtPassword;
+        CheckBox chkShow;
+        CheckBox chkConnect;
+
+        public NewConnectionDialog(string themeName, string rootFolder, List<string> folders, string initialFolder)
+        {
+            root = rootFolder.TrimEnd('\\', '/');
+
+            AutoScaleMode = AutoScaleMode.None;
+            Text = "Нове підключення";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            Width = 400;
+            Height = 430;
+            Font = new Font("Segoe UI", 9.5f);
+
+            const int W = 360;
+            var lblAddress = new Label { Text = "Комп'ютер (ім'я або адреса):", Left = 12, Top = 16, Width = W };
+            txtAddress = new TextBox { Left = 12, Top = 38, Width = W };
+
+            var lblUser = new Label { Text = "Користувач:", Left = 12, Top = 70, Width = W };
+            txtUser = new TextBox { Left = 12, Top = 92, Width = W };
+
+            var lblPwd = new Label { Text = "Пароль (необов'язково, збережеться для цього підключення):", Left = 12, Top = 124, Width = W };
+            txtPassword = new TextBox { Left = 12, Top = 146, Width = W, UseSystemPasswordChar = true };
+            chkShow = new CheckBox { Text = "Показати пароль", Left = 12, Top = 174, Width = 200 };
+            chkShow.CheckedChanged += (s, e) => txtPassword.UseSystemPasswordChar = !chkShow.Checked;
+
+            var lblName = new Label { Text = "Назва (порожньо -- за адресою):", Left = 12, Top = 206, Width = W };
+            txtName = new TextBox { Left = 12, Top = 228, Width = W };
+
+            var lblFolder = new Label { Text = "Папка (можна вписати нову підпапку):", Left = 12, Top = 260, Width = W };
+            cmbFolder = new ComboBox { Left = 12, Top = 282, Width = W, DropDownStyle = ComboBoxStyle.DropDown };
+            cmbFolder.Items.Add(RootLabel);
+            foreach (var f in folders) cmbFolder.Items.Add(f);
+            cmbFolder.Text = string.IsNullOrEmpty(initialFolder) ? RootLabel : initialFolder;
+
+            chkConnect = new CheckBox { Text = "Підключитися одразу після створення", Left = 12, Top = 314, Width = W };
+
+            var btnOk = new Button { Text = "Створити", Left = 192, Top = 348, Width = 85 };
+            btnOk.Click += (s, e) => Accept();
+            var btnCancel = new Button { Text = "Скасувати", Left = 284, Top = 348, Width = 85, DialogResult = DialogResult.Cancel };
+
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            Controls.Add(lblAddress);
+            Controls.Add(txtAddress);
+            Controls.Add(lblUser);
+            Controls.Add(txtUser);
+            Controls.Add(lblPwd);
+            Controls.Add(txtPassword);
+            Controls.Add(chkShow);
+            Controls.Add(lblName);
+            Controls.Add(txtName);
+            Controls.Add(lblFolder);
+            Controls.Add(cmbFolder);
+            Controls.Add(chkConnect);
+            Controls.Add(btnOk);
+            Controls.Add(btnCancel);
+
+            ThemeManager.Apply(this, themeName);
+
+            Load += (s, e) => txtAddress.Focus();
+        }
+
+        // Папка з поля: "(корінь)" або порожньо -- корінь; "/" вважається "\"; кожен
+        // сегмент має бути коректною назвою папки (без "..", заборонених символів).
+        static bool TryNormalizeFolder(string text, out string folder)
+        {
+            folder = "";
+            text = (text ?? "").Trim();
+            if (text.Length == 0 || text == RootLabel) return true;
+
+            var segments = text.Replace('/', '\\').Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            var invalid = Path.GetInvalidFileNameChars();
+            foreach (var seg in segments)
+            {
+                var name = seg.Trim();
+                if (name.Length == 0 || name == "." || name == ".." || name.IndexOfAny(invalid) >= 0 || name.EndsWith(".")) return false;
+            }
+            folder = string.Join("\\", segments.Select(x => x.Trim()));
+            return true;
+        }
+
+        void Accept()
+        {
+            var address = txtAddress.Text.Trim();
+            if (address.Length == 0)
+            {
+                MessageBox.Show(this, "Вкажіть ім'я або адресу комп'ютера.", "Перевірка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtAddress.Focus();
+                return;
+            }
+
+            var name = txtName.Text.Trim();
+            if (name.Length == 0) name = address;
+            if (name.EndsWith(".rdp", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 4).Trim();
+            // Двокрапка (адреса з портом) у назві файлу неприпустима -- замінюємо.
+            name = name.Replace(':', '_');
+            if (name.Length == 0 || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || name.EndsWith("."))
+            {
+                MessageBox.Show(this, "Назва містить недопустимі символи (\\ / : * ? \" < > |).", "Перевірка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtName.Focus();
+                return;
+            }
+
+            string folder;
+            if (!TryNormalizeFolder(cmbFolder.Text, out folder))
+            {
+                MessageBox.Show(this, "Назва папки містить недопустимі символи.", "Перевірка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                cmbFolder.Focus();
+                return;
+            }
+
+            var path = folder.Length == 0 ? Path.Combine(root, name + ".rdp") : Path.Combine(root, folder, name + ".rdp");
+            if (File.Exists(path))
+            {
+                MessageBox.Show(this, "Підключення \"" + name + "\" у цій папці вже існує. Вкажіть іншу назву.",
+                    "Перевірка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtName.Focus();
+                return;
+            }
+
+            FileName = name;
+            FolderKey = folder;
+            FullPath = path;
+            Address = address;
+            User = txtUser.Text.Trim();
+            Password = txtPassword.Text;
+            ConnectNow = chkConnect.Checked;
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+    }
+
+    // Створення нового .rdp: діалог -> файл у вибраній папці -> пароль підключення в
+    // спільних налаштуваннях. Спільне для головного вікна й вікна швидкого пошуку.
+    public static class NewConnectionCreator
+    {
+        // Повертає створений запис або null (скасовано чи помилка).
+        public static RdpEntry Create(IWin32Window owner, AppSettings s, string initialFolderKey, out bool connectNow)
+        {
+            connectNow = false;
+            if (string.IsNullOrWhiteSpace(s.RootFolder) || !Directory.Exists(s.RootFolder))
+            {
+                MessageBox.Show(owner, "Спершу вкажіть папку з підключеннями в Налаштуваннях.", "Нове підключення",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return null;
+            }
+
+            using (var dlg = new NewConnectionDialog(s.Theme, s.RootFolder, RdpScanner.ListFolders(s.RootFolder), initialFolderKey))
+            {
+                if (dlg.ShowDialog(owner) != DialogResult.OK) return null;
+
+                RdpEntry entry;
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(dlg.FullPath));
+                    RdpFileEditor.Create(dlg.FullPath, dlg.Address, dlg.User);
+
+                    entry = new RdpEntry
+                    {
+                        FullPath = dlg.FullPath,
+                        DisplayName = dlg.FileName,
+                        RelativeFolder = dlg.FolderKey.Length == 0 ? "(корінь)" : dlg.FolderKey,
+                        RelativePath = RdpScanner.MakeRelative(s.RootFolder, dlg.FullPath) ?? Path.GetFileName(dlg.FullPath),
+                        FolderKey = dlg.FolderKey
+                    };
+                    entry.RefreshConnectionInfo();
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(owner, "Не вдалося створити підключення:\n" + ex.Message, "Помилка", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return null;
+                }
+
+                if (!string.IsNullOrEmpty(dlg.Password))
+                {
+                    try
+                    {
+                        PasswordMenu.Change(s, () => PasswordManager.SetFilePassword(s, entry, dlg.Password), () => { });
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(owner, "Підключення створено, але пароль зберегти не вдалося:\n" + ex.Message,
+                            "Пароль", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                }
+
+                connectNow = dlg.ConnectNow;
+                return entry;
             }
         }
     }
@@ -3932,7 +4335,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.7.1";
+        public const string AppVersion = "1.8.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
