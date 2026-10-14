@@ -307,6 +307,8 @@ namespace RdpConsole
         [DataMember] public Dictionary<string, string> FolderPasswords { get; set; }
         [DataMember] public List<DefaultCredential> DefaultCredentials { get; set; }
         [DataMember] public bool StoreInWindowsCredentials { get; set; }
+        // Відносні шляхи папок, файли яких (разом із підпапками) не беруть участі в пошуку.
+        [DataMember] public List<string> SearchExcludedFolders { get; set; }
 
         public static AppSettings CreateDefault()
         {
@@ -337,6 +339,7 @@ namespace RdpConsole
                 ? new Dictionary<string, string>(FolderPasswords, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             if (DefaultCredentials == null) DefaultCredentials = new List<DefaultCredential>();
+            if (SearchExcludedFolders == null) SearchExcludedFolders = new List<string>();
             if (string.IsNullOrEmpty(Theme)) Theme = ThemeManager.LightThemeName;
         }
 
@@ -348,6 +351,7 @@ namespace RdpConsole
             Theme = o.Theme;
             MicaEnabled = o.MicaEnabled;
             StoreInWindowsCredentials = o.StoreInWindowsCredentials;
+            SearchExcludedFolders = o.SearchExcludedFolders == null ? null : new List<string>(o.SearchExcludedFolders);
             FilePasswords = o.FilePasswords == null ? null : o.FilePasswords.ToDictionary(
                 kv => kv.Key, kv => new SavedCredential { Host = kv.Value.Host, User = kv.Value.User, Password = kv.Value.Password });
             FolderPasswords = o.FolderPasswords == null ? null : new Dictionary<string, string>(o.FolderPasswords);
@@ -1720,6 +1724,70 @@ namespace RdpConsole
         }
     }
 
+    // Пошук підключень -- спільний для головного вікна й вікна швидкого пошуку з трея.
+    public static class RdpSearch
+    {
+        // Одні й ті самі фізичні клавіші в розкладках EN / УКР / РУС (рядок ` ... /) --
+        // щоб знаходити підключення, навіть якщо запит набрано не в тій розкладці
+        // ("ыкм" чи "ізм" -> "srv", "cthdth" -> "сервер").
+        static readonly string[] Layouts =
+        {
+            "`qwertyuiop[]asdfghjkl;'zxcvbnm,./",
+            "'йцукенгшщзхїфівапролджєячсмитьбю.",
+            "ёйцукенгшщзхъфывапролджэячсмитьбю."
+        };
+
+        // Сам запит плюс його "переклад" з кожної розкладки в кожну іншу.
+        public static List<string> QueryVariants(string query)
+        {
+            var q = query.ToLowerInvariant();
+            var variants = new List<string> { q };
+            foreach (var from in Layouts)
+            {
+                foreach (var to in Layouts)
+                {
+                    if (ReferenceEquals(from, to)) continue;
+                    var sb = new StringBuilder(q.Length);
+                    foreach (var c in q)
+                    {
+                        var idx = from.IndexOf(c);
+                        sb.Append(idx >= 0 ? to[idx] : c);
+                    }
+                    var v = sb.ToString();
+                    if (!variants.Contains(v)) variants.Add(v);
+                }
+            }
+            return variants;
+        }
+
+        public static bool IsExcludedFolder(AppSettings s, string folderKey)
+        {
+            return !string.IsNullOrEmpty(folderKey) &&
+                   s.SearchExcludedFolders.Any(f => string.Equals(f, folderKey, StringComparison.OrdinalIgnoreCase));
+        }
+
+        // Файл у папці "не бере участі в пошуку" або в будь-якій її підпапці.
+        public static bool IsExcluded(AppSettings s, RdpEntry e)
+        {
+            foreach (var f in s.SearchExcludedFolders)
+            {
+                if (string.Equals(e.FolderKey, f, StringComparison.OrdinalIgnoreCase) ||
+                    e.FolderKey.StartsWith(f + "\\", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        public static IEnumerable<RdpEntry> Filter(AppSettings s, IEnumerable<RdpEntry> entries, string filter)
+        {
+            if (filter.Length == 0) return entries;
+            var variants = QueryVariants(filter);
+            return entries.Where(x => !IsExcluded(s, x) && variants.Any(v =>
+                x.DisplayName.IndexOf(v, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                x.RelativeFolder.IndexOf(v, StringComparison.OrdinalIgnoreCase) >= 0));
+        }
+    }
+
     // Пункти контекстного меню для паролів і підписи з мітками джерела пароля --
     // спільні для головного вікна та вікна швидкого пошуку з трея.
     public static class PasswordMenu
@@ -1734,7 +1802,23 @@ namespace RdpConsole
         // Мітка папки з власним паролем у дереві.
         public static string FolderLabel(AppSettings s, string folderKey, string name)
         {
-            return HasFolderPassword(s, folderKey) ? name + "   🔑" : name;
+            if (HasFolderPassword(s, folderKey)) name += "   🔑";
+            if (RdpSearch.IsExcludedFolder(s, folderKey)) name += "   (без пошуку)";
+            return name;
+        }
+
+        // Перемикач "Не бере участь у пошуку" для папки в дереві.
+        public static void AddFolderSearchItem(ToolStripItemCollection items, AppSettings s, string folderKey, Action onChanged)
+        {
+            bool excluded = RdpSearch.IsExcludedFolder(s, folderKey);
+            var mi = new ToolStripMenuItem("Не бере участь у пошуку") { Checked = excluded };
+            mi.Click += (o, ev) => Change(s, () =>
+            {
+                if (excluded) s.SearchExcludedFolders.RemoveAll(f => string.Equals(f, folderKey, StringComparison.OrdinalIgnoreCase));
+                else s.SearchExcludedFolders.Add(folderKey);
+            }, onChanged);
+            items.Add(new ToolStripSeparator());
+            items.Add(mi);
         }
 
         public static bool HasFolderPassword(AppSettings s, string folderKey)
@@ -2554,13 +2638,7 @@ namespace RdpConsole
             listView.Groups.Clear();
             listView.Items.Clear();
 
-            IEnumerable<RdpEntry> src = allEntries;
-            if (filter.Length > 0)
-            {
-                src = allEntries.Where(x =>
-                    x.DisplayName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    x.RelativeFolder.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
-            }
+            var src = RdpSearch.Filter(settings, allEntries, filter);
 
             var groups = new Dictionary<string, ListViewGroup>();
             int shown = 0;
@@ -2715,6 +2793,7 @@ namespace RdpConsole
             if (folder != null)
             {
                 PasswordMenu.AddFolderItems(itemMenu.Items, this, settings, folder.RelativePath, false, a => a(), ApplyFilter);
+                PasswordMenu.AddFolderSearchItem(itemMenu.Items, settings, folder.RelativePath, ApplyFilter);
                 return;
             }
 
@@ -3086,13 +3165,7 @@ namespace RdpConsole
                 return;
             }
 
-            IEnumerable<RdpEntry> matches = allEntries;
-            if (filter.Length > 0)
-            {
-                matches = allEntries.Where(x =>
-                    x.DisplayName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    x.RelativeFolder.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
-            }
+            var matches = RdpSearch.Filter(settings, allEntries, filter);
 
             lstResults.BeginUpdate();
             lstResults.Items.Clear();
@@ -3195,6 +3268,7 @@ namespace RdpConsole
             {
                 suppressClose = true;
                 PasswordMenu.AddFolderItems(resultMenu.Items, this, settings, folder.RelativePath, false, RunModal, OnPasswordsChanged);
+                PasswordMenu.AddFolderSearchItem(resultMenu.Items, settings, folder.RelativePath, OnPasswordsChanged);
                 return;
             }
 
@@ -3828,7 +3902,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.6.0";
+        public const string AppVersion = "1.7.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
