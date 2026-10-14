@@ -262,8 +262,126 @@ namespace RdpConsole
         }
     }
 
+    // Облікові дані, збережені для конкретного .rdp-файлу. Host/User -- значення з самого
+    // файлу: за ними пароль знаходить файл знову, якщо його перейменували чи перенесли в
+    // іншу підпапку (див. PasswordManager.Reconcile).
+    [DataContract]
+    public class SavedCredential
+    {
+        [DataMember] public string Host { get; set; }
+        [DataMember] public string User { get; set; }
+        [DataMember] public string Password { get; set; }
+    }
+
+    // Пароль за замовчуванням для певного користувача; порожній User -- для будь-якого.
+    [DataContract]
+    public class DefaultCredential
+    {
+        [DataMember] public string User { get; set; }
+        [DataMember] public string Password { get; set; }
+    }
+
+    // Налаштування поділено на дві частини:
+    //  - локальні (лише цей ПК, без DataMember): папка з .rdp, розмір вікна, папка
+    //    збереження налаштувань -- %AppData%\RdpConsole\local.json, без шифрування
+    //    (паролів там немає);
+    //  - спільні (DataMember): паролі, тема, гаряча клавіша тощо -- шифрований файл
+    //    RdpConsole.dat у вибраній папці (наприклад, на Google Drive), тож ті самі
+    //    налаштування доступні з різних ПК.
     [DataContract]
     public class AppSettings
+    {
+        public string RootFolder { get; set; }
+        public int WindowWidth { get; set; }
+        public int WindowHeight { get; set; }
+        public string SettingsFolder { get; set; }
+
+        [DataMember] public bool HierarchyView { get; set; }
+        [DataMember] public uint HotkeyModifiers { get; set; }
+        [DataMember] public uint HotkeyKey { get; set; }
+        [DataMember] public string Theme { get; set; }
+        [DataMember] public bool MicaEnabled { get; set; }
+        // Ключ -- шлях .rdp відносно кореневої папки (на різних ПК корінь може бути різним).
+        [DataMember] public Dictionary<string, SavedCredential> FilePasswords { get; set; }
+        // Ключ -- шлях підпапки відносно кореневої папки; діє на всі файли всередині неї.
+        [DataMember] public Dictionary<string, string> FolderPasswords { get; set; }
+        [DataMember] public List<DefaultCredential> DefaultCredentials { get; set; }
+        [DataMember] public bool StoreInWindowsCredentials { get; set; }
+
+        public static AppSettings CreateDefault()
+        {
+            var s = new AppSettings
+            {
+                RootFolder = "",
+                WindowWidth = 940,
+                WindowHeight = 620,
+                SettingsFolder = "",
+                HierarchyView = true,
+                HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT,
+                HotkeyKey = HotkeyUtil.DefaultVk,
+                Theme = ThemeManager.LightThemeName,
+                MicaEnabled = false
+            };
+            s.Normalize();
+            return s;
+        }
+
+        // Після десеріалізації колекції можуть бути null, а словники втрачають
+        // регістронезалежне порівняння ключів (шляхи Windows) -- відновлюємо.
+        public void Normalize()
+        {
+            FilePasswords = FilePasswords != null
+                ? new Dictionary<string, SavedCredential>(FilePasswords, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, SavedCredential>(StringComparer.OrdinalIgnoreCase);
+            FolderPasswords = FolderPasswords != null
+                ? new Dictionary<string, string>(FolderPasswords, StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (DefaultCredentials == null) DefaultCredentials = new List<DefaultCredential>();
+            if (string.IsNullOrEmpty(Theme)) Theme = ThemeManager.LightThemeName;
+        }
+
+        public void CopySharedFrom(AppSettings o)
+        {
+            HierarchyView = o.HierarchyView;
+            HotkeyModifiers = o.HotkeyModifiers;
+            HotkeyKey = o.HotkeyKey;
+            Theme = o.Theme;
+            MicaEnabled = o.MicaEnabled;
+            StoreInWindowsCredentials = o.StoreInWindowsCredentials;
+            FilePasswords = o.FilePasswords == null ? null : o.FilePasswords.ToDictionary(
+                kv => kv.Key, kv => new SavedCredential { Host = kv.Value.Host, User = kv.Value.User, Password = kv.Value.Password });
+            FolderPasswords = o.FolderPasswords == null ? null : new Dictionary<string, string>(o.FolderPasswords);
+            DefaultCredentials = o.DefaultCredentials == null ? null : o.DefaultCredentials
+                .Select(d => new DefaultCredential { User = d.User, Password = d.Password }).ToList();
+            Normalize();
+        }
+
+        public AppSettings Clone()
+        {
+            var c = new AppSettings
+            {
+                RootFolder = RootFolder,
+                WindowWidth = WindowWidth,
+                WindowHeight = WindowHeight,
+                SettingsFolder = SettingsFolder
+            };
+            c.CopySharedFrom(this);
+            return c;
+        }
+    }
+
+    [DataContract]
+    class LocalSettings
+    {
+        [DataMember] public string RootFolder { get; set; }
+        [DataMember] public int WindowWidth { get; set; }
+        [DataMember] public int WindowHeight { get; set; }
+        [DataMember] public string SettingsFolder { get; set; }
+    }
+
+    // Формат settings.json до v1.6 -- читається лише один раз, для перенесення.
+    [DataContract]
+    class LegacySettings
     {
         [DataMember] public string RootFolder { get; set; }
         [DataMember] public int WindowWidth { get; set; }
@@ -275,93 +393,358 @@ namespace RdpConsole
         [DataMember] public uint HotkeyKey { get; set; }
         [DataMember] public string Theme { get; set; }
         [DataMember] public bool MicaEnabled { get; set; }
+    }
 
-        public static AppSettings CreateDefault()
+    // Шифрування спільного файлу налаштувань: AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC).
+    // Ключ вшито в програму -- файл може лежати на Google Drive й читатися на будь-якому ПК
+    // без введення майстер-пароля. Захищає від стороннього погляду на файл, але не від
+    // того, хто має і файл, і вихідний код програми.
+    internal static class SettingsCrypto
+    {
+        static readonly byte[] Secret =
         {
-            return new AppSettings
+            0x7D, 0xDE, 0x75, 0xEB, 0xE8, 0xE6, 0x56, 0x9C, 0x1A, 0x2D, 0x2C, 0x19, 0x27, 0xE5, 0x0C, 0x29,
+            0x2E, 0x85, 0x11, 0xBE, 0x6B, 0xCF, 0x6B, 0x98, 0xCC, 0x82, 0xAA, 0x5E, 0xD4, 0x01, 0x52, 0xEF
+        };
+        static readonly byte[] Magic = Encoding.ASCII.GetBytes("RDPC1");
+        const int IvSize = 16;
+        const int MacSize = 32;
+
+        static byte[] DeriveKey(string purpose)
+        {
+            using (var sha = SHA256.Create())
             {
-                RootFolder = "",
-                WindowWidth = 940,
-                WindowHeight = 620,
-                EncryptedPasswords = new Dictionary<string, string>(),
-                HierarchyView = true,
-                HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT,
-                HotkeyKey = HotkeyUtil.DefaultVk,
-                Theme = ThemeManager.LightThemeName,
-                MicaEnabled = false
-            };
+                return sha.ComputeHash(Secret.Concat(Encoding.ASCII.GetBytes(purpose)).ToArray());
+            }
+        }
+
+        public static byte[] Encrypt(byte[] plain)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.KeySize = 256;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+                aes.Key = DeriveKey("enc");
+                aes.GenerateIV();
+
+                byte[] cipher;
+                using (var enc = aes.CreateEncryptor()) cipher = enc.TransformFinalBlock(plain, 0, plain.Length);
+
+                var body = Magic.Concat(aes.IV).Concat(cipher).ToArray();
+                using (var hmac = new HMACSHA256(DeriveKey("mac")))
+                {
+                    return body.Concat(hmac.ComputeHash(body)).ToArray();
+                }
+            }
+        }
+
+        // null -- файл пошкоджено, змінено вручну або це не наш формат.
+        public static byte[] Decrypt(byte[] data)
+        {
+            if (data == null || data.Length < Magic.Length + IvSize + 16 + MacSize) return null;
+            for (int i = 0; i < Magic.Length; i++) if (data[i] != Magic[i]) return null;
+
+            int bodyLen = data.Length - MacSize;
+            byte[] expected;
+            using (var hmac = new HMACSHA256(DeriveKey("mac"))) expected = hmac.ComputeHash(data, 0, bodyLen);
+            int diff = 0;
+            for (int i = 0; i < MacSize; i++) diff |= expected[i] ^ data[bodyLen + i];
+            if (diff != 0) return null;
+
+            using (var aes = Aes.Create())
+            {
+                aes.KeySize = 256;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+                aes.Key = DeriveKey("enc");
+                aes.IV = data.Skip(Magic.Length).Take(IvSize).ToArray();
+                int cipherStart = Magic.Length + IvSize;
+                using (var dec = aes.CreateDecryptor())
+                {
+                    return dec.TransformFinalBlock(data, cipherStart, bodyLen - cipherStart);
+                }
+            }
         }
     }
 
     public static class SettingsManager
     {
-        static string SettingsDir
+        const string SharedFileName = "RdpConsole.dat";
+
+        public static string LocalDir
         {
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "RdpConsole"); }
         }
 
-        static string SettingsPath
+        static string LocalPath { get { return Path.Combine(LocalDir, "local.json"); } }
+        static string LegacyPath { get { return Path.Combine(LocalDir, "settings.json"); } }
+
+        public static string SharedPath(AppSettings s)
         {
-            get { return Path.Combine(SettingsDir, "settings.json"); }
+            var dir = string.IsNullOrWhiteSpace(s.SettingsFolder) ? LocalDir : s.SettingsFolder.Trim();
+            return Path.Combine(dir, SharedFileName);
         }
+
+        // Час зміни спільного файлу на момент останнього читання/запису -- щоб помітити,
+        // що його змінили з іншого ПК (через Google Drive), і перечитати перед записом.
+        static string stampPath;
+        static DateTime stampTime;
+
+        // Файл існує, але прочитати його не вдалося (пошкоджений, недосинхронізований
+        // тощо) -- такий файл НЕ перезаписуємо, інакше втратимо всі збережені паролі.
+        static string blockedPath;
+
+        public static string LoadError { get; private set; }
 
         public static AppSettings Load()
         {
+            var s = AppSettings.CreateDefault();
+            var local = ReadJson<LocalSettings>(LocalPath);
+            if (local == null && File.Exists(LegacyPath))
+            {
+                MigrateLegacy(s);
+                return s;
+            }
+            if (local != null)
+            {
+                s.RootFolder = local.RootFolder ?? "";
+                s.WindowWidth = local.WindowWidth;
+                s.WindowHeight = local.WindowHeight;
+                s.SettingsFolder = local.SettingsFolder ?? "";
+            }
+            ReloadShared(s, false);
+            return s;
+        }
+
+        // Перечитує спільний файл у вже наявний об'єкт налаштувань (форми тримають на нього
+        // посилання). onlyIfChanged -- лише якщо файл змінився з моменту останнього
+        // читання/запису. true -- налаштування оновлено.
+        public static bool ReloadShared(AppSettings s, bool onlyIfChanged)
+        {
+            var path = SharedPath(s);
             try
             {
-                if (File.Exists(SettingsPath))
+                if (!File.Exists(path)) return false;
+                var time = File.GetLastWriteTimeUtc(path);
+                if (onlyIfChanged && string.Equals(path, stampPath, StringComparison.OrdinalIgnoreCase) && time == stampTime)
+                    return false;
+
+                var shared = ReadShared(path);
+                if (shared == null)
                 {
-                    using (var fs = File.OpenRead(SettingsPath))
-                    {
-                        var ser = new DataContractJsonSerializer(typeof(AppSettings));
-                        var s = (AppSettings)ser.ReadObject(fs);
-                        if (s.EncryptedPasswords == null) s.EncryptedPasswords = new Dictionary<string, string>();
-                        // Старі файли налаштувань (до появи цієї функції) не мають цих полів --
-                        // після десеріалізації вони будуть 0, повертаємо типову комбінацію.
-                        if (s.HotkeyKey == 0)
-                        {
-                            s.HotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
-                            s.HotkeyKey = HotkeyUtil.DefaultVk;
-                        }
-                        if (string.IsNullOrEmpty(s.Theme)) s.Theme = ThemeManager.LightThemeName;
-                        return s;
-                    }
+                    blockedPath = path;
+                    LoadError = "Не вдалося прочитати файл налаштувань:\n" + path +
+                                "\n\nФайл пошкоджено або він ще не синхронізувався. Зміни паролів і налаштувань " +
+                                "не будуть записані в нього, поки файл не стане читабельним.";
+                    return false;
+                }
+
+                s.CopySharedFrom(shared);
+                stampPath = path;
+                stampTime = time;
+                if (string.Equals(blockedPath, path, StringComparison.OrdinalIgnoreCase)) blockedPath = null;
+                LoadError = null;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static AppSettings ReadShared(string path)
+        {
+            try
+            {
+                var plain = SettingsCrypto.Decrypt(File.ReadAllBytes(path));
+                if (plain == null) return null;
+                using (var ms = new MemoryStream(plain))
+                {
+                    var s = (AppSettings)new DataContractJsonSerializer(typeof(AppSettings)).ReadObject(ms);
+                    s.Normalize();
+                    return s;
                 }
             }
             catch
             {
-                // повернемо типові налаштування, якщо файл пошкоджено
+                return null;
             }
-            return AppSettings.CreateDefault();
         }
 
         public static void Save(AppSettings s)
         {
+            SaveLocal(s);
+            SaveShared(s);
+        }
+
+        public static void SaveLocal(AppSettings s)
+        {
             try
             {
-                Directory.CreateDirectory(SettingsDir);
-                using (var fs = File.Create(SettingsPath))
+                Directory.CreateDirectory(LocalDir);
+                WriteJson(LocalPath, new LocalSettings
                 {
-                    var ser = new DataContractJsonSerializer(typeof(AppSettings));
-                    ser.WriteObject(fs, s);
-                }
+                    RootFolder = s.RootFolder,
+                    WindowWidth = s.WindowWidth,
+                    WindowHeight = s.WindowHeight,
+                    SettingsFolder = s.SettingsFolder
+                });
             }
             catch
             {
                 // тихо ігноруємо помилки збереження (наприклад, немає прав на запис)
             }
         }
+
+        // force -- свідомо перезаписати навіть нечитабельний файл (користувач підтвердив).
+        public static bool SaveShared(AppSettings s, bool force = false)
+        {
+            var path = SharedPath(s);
+            if (!force && string.Equals(path, blockedPath, StringComparison.OrdinalIgnoreCase)) return false;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                byte[] plain;
+                using (var ms = new MemoryStream())
+                {
+                    new DataContractJsonSerializer(typeof(AppSettings)).WriteObject(ms, s);
+                    plain = ms.ToArray();
+                }
+
+                // Спершу пишемо поруч у тимчасовий файл, потім підміняємо -- щоб збій
+                // посеред запису не залишив пошкоджений файл з усіма паролями.
+                var tmp = path + ".tmp";
+                File.WriteAllBytes(tmp, SettingsCrypto.Encrypt(plain));
+                if (File.Exists(path))
+                {
+                    try { File.Replace(tmp, path, null); }
+                    catch { File.Copy(tmp, path, true); File.Delete(tmp); }
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
+
+                stampPath = path;
+                stampTime = File.GetLastWriteTimeUtc(path);
+                blockedPath = null;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Перенесення зі старого settings.json: паролі там були зашифровані DPAPI і
+        // прив'язані до повного шляху файлу -- розшифровуємо й переводимо на шляхи
+        // відносно кореневої папки. Старий файл перейменовується на settings.json.bak.
+        static void MigrateLegacy(AppSettings s)
+        {
+            var old = ReadJson<LegacySettings>(LegacyPath);
+            if (old == null) return;
+
+            s.RootFolder = old.RootFolder ?? "";
+            s.WindowWidth = old.WindowWidth;
+            s.WindowHeight = old.WindowHeight;
+            s.HierarchyView = old.HierarchyView;
+            s.MicaEnabled = old.MicaEnabled;
+            if (!string.IsNullOrEmpty(old.Theme)) s.Theme = old.Theme;
+            if (old.HotkeyKey != 0)
+            {
+                s.HotkeyModifiers = old.HotkeyModifiers;
+                s.HotkeyKey = old.HotkeyKey;
+            }
+
+            if (old.EncryptedPasswords != null)
+            {
+                foreach (var kv in old.EncryptedPasswords)
+                {
+                    var pwd = PasswordManager.DecryptLegacy(kv.Value);
+                    var rel = RdpScanner.MakeRelative(s.RootFolder, kv.Key);
+                    if (string.IsNullOrEmpty(pwd) || rel == null) continue;
+
+                    string host = "", user = "";
+                    try { if (File.Exists(kv.Key)) RdpFileEditor.Read(kv.Key, out host, out user); } catch { }
+                    s.FilePasswords[rel] = new SavedCredential { Host = host, User = user, Password = pwd };
+                }
+            }
+
+            var defaultPwd = PasswordManager.DecryptLegacy(old.DefaultEncryptedPassword);
+            if (!string.IsNullOrEmpty(defaultPwd))
+            {
+                s.DefaultCredentials.Add(new DefaultCredential { User = "", Password = defaultPwd });
+            }
+
+            SaveLocal(s);
+            if (SaveShared(s))
+            {
+                try
+                {
+                    var bak = LegacyPath + ".bak";
+                    if (File.Exists(bak)) File.Delete(bak);
+                    File.Move(LegacyPath, bak);
+                }
+                catch { }
+            }
+        }
+
+        static T ReadJson<T>(string path) where T : class
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                using (var fs = File.OpenRead(path))
+                {
+                    return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(fs);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        static void WriteJson<T>(string path, T value)
+        {
+            using (var fs = File.Create(path))
+            {
+                new DataContractJsonSerializer(typeof(T)).WriteObject(fs, value);
+            }
+        }
     }
 
-    // Перевіряє, чи в Диспетчері облікових даних Windows (Панель керування -> Диспетчер
-    // облікових даних -> Облікові дані Windows) уже є збережений логін/пароль для
-    // конкретного RDP-сервера -- саме там mstsc зберігає позначку "Запам'ятати мене"
-    // під ключем "TERMSRV/<адреса>". Використовується, щоб не підставляти пароль за
-    // замовчуванням поверх уже наявних у Windows облікових даних.
+    // Облікові дані RDP-серверів у Диспетчері облікових даних Windows (Панель керування
+    // -> Диспетчер облікових даних -> Облікові дані Windows) -- саме там mstsc зберігає
+    // позначку "Запам'ятати мене" під ключем "TERMSRV/<адреса>".
     internal static class WindowsCredentialStore
     {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct CREDENTIAL
+        {
+            public uint Flags;
+            public uint Type;
+            public string TargetName;
+            public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint Persist;
+            public uint AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         static extern bool CredRead(string target, uint type, int reservedFlag, out IntPtr credentialPtr);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CredWrite(ref CREDENTIAL credential, uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CredDelete(string target, uint type, int flags);
 
         [DllImport("advapi32.dll", SetLastError = true)]
         static extern void CredFree(IntPtr cred);
@@ -369,45 +752,117 @@ namespace RdpConsole
         const uint CRED_TYPE_GENERIC = 1;
         const uint CRED_TYPE_DOMAIN_PASSWORD = 2;
         const uint CRED_TYPE_DOMAIN_VISIBLE_PASSWORD = 4;
+        const uint CRED_PERSIST_LOCAL_MACHINE = 2;
+
+        static readonly uint[] TypesToCheck = { CRED_TYPE_DOMAIN_PASSWORD, CRED_TYPE_GENERIC, CRED_TYPE_DOMAIN_VISIBLE_PASSWORD };
+
+        // Індикатор пароля перевіряється для кожного рядка при кожному оновленні списку --
+        // кешуємо результат; кеш скидається при перескануванні (F5) і після запису/видалення.
+        static readonly Dictionary<string, bool> cache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+
+        public static void ClearCache()
+        {
+            cache.Clear();
+        }
 
         public static bool HasStoredCredential(string hostname)
         {
             if (string.IsNullOrEmpty(hostname)) return false;
+            bool result;
+            if (cache.TryGetValue(hostname, out result)) return result;
+
             var target = "TERMSRV/" + hostname;
-            foreach (var type in new[] { CRED_TYPE_DOMAIN_PASSWORD, CRED_TYPE_GENERIC, CRED_TYPE_DOMAIN_VISIBLE_PASSWORD })
+            result = false;
+            foreach (var type in TypesToCheck)
             {
                 IntPtr credPtr;
                 if (CredRead(target, type, 0, out credPtr))
                 {
                     CredFree(credPtr);
-                    return true;
+                    result = true;
+                    break;
                 }
             }
-            return false;
+            cache[hostname] = result;
+            return result;
+        }
+
+        // Той самий тип запису, що створює сам mstsc ("Запам'ятати мене") або
+        // "cmdkey /add:TERMSRV/<хост>" -- mstsc підхоплює його без запиту пароля.
+        public static void Write(string hostname, string user, string password)
+        {
+            var blob = Marshal.StringToCoTaskMemUni(password);
+            try
+            {
+                var cred = new CREDENTIAL
+                {
+                    Type = CRED_TYPE_DOMAIN_PASSWORD,
+                    TargetName = "TERMSRV/" + hostname,
+                    UserName = user,
+                    CredentialBlob = blob,
+                    CredentialBlobSize = (uint)(password.Length * 2),
+                    Persist = CRED_PERSIST_LOCAL_MACHINE
+                };
+                if (!CredWrite(ref cred, 0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            }
+            finally
+            {
+                Marshal.ZeroFreeCoTaskMemUnicode(blob);
+                cache.Remove(hostname);
+            }
+        }
+
+        public static bool Delete(string hostname)
+        {
+            if (string.IsNullOrEmpty(hostname)) return false;
+            bool any = false;
+            foreach (var type in TypesToCheck)
+            {
+                if (CredDelete("TERMSRV/" + hostname, type, 0)) any = true;
+            }
+            cache.Remove(hostname);
+            return any;
         }
     }
 
-    // Пароль шифрується за допомогою Windows DPAPI (прив'язка до поточного облікового
-    // запису Windows на цій машині) -- так само, як зберігають майстер-паролі інші
-    // менеджери підключень (наприклад, mRemoteNG). Ніхто інший, ані на цьому, ані на
-    // іншому комп'ютері, розшифрувати збережений пароль не зможе.
+    public enum PasswordSource { None, Windows, File, Folder, Default }
+
+    public class PasswordInfo
+    {
+        public PasswordSource Source;
+        public string Password;
+        public string Description;
+
+        // Значок у колонці "Пароль": W -- облікові дані Windows, ✓ -- власний пароль
+        // підключення, 📁 -- пароль папки, • -- за замовчуванням, порожньо -- нічого.
+        public string Marker
+        {
+            get
+            {
+                switch (Source)
+                {
+                    case PasswordSource.Windows: return "W";
+                    case PasswordSource.File: return "✓";
+                    case PasswordSource.Folder: return "📁";
+                    case PasswordSource.Default: return "•";
+                    default: return "";
+                }
+            }
+        }
+    }
+
     public static class PasswordManager
     {
-        static readonly byte[] Entropy = Encoding.UTF8.GetBytes("RdpConsole.v1.pwd");
+        // Ентропія DPAPI зі старого формату (до v1.6) -- лише для перенесення паролів.
+        static readonly byte[] LegacyEntropy = Encoding.UTF8.GetBytes("RdpConsole.v1.pwd");
 
-        public static string Encrypt(string plainPassword)
+        public static string DecryptLegacy(string encryptedBase64)
         {
-            var bytes = Encoding.UTF8.GetBytes(plainPassword);
-            var protectedBytes = ProtectedData.Protect(bytes, Entropy, DataProtectionScope.CurrentUser);
-            return Convert.ToBase64String(protectedBytes);
-        }
-
-        public static string Decrypt(string encryptedBase64)
-        {
+            if (string.IsNullOrEmpty(encryptedBase64)) return null;
             try
             {
                 var protectedBytes = Convert.FromBase64String(encryptedBase64);
-                var bytes = ProtectedData.Unprotect(protectedBytes, Entropy, DataProtectionScope.CurrentUser);
+                var bytes = ProtectedData.Unprotect(protectedBytes, LegacyEntropy, DataProtectionScope.CurrentUser);
                 return Encoding.UTF8.GetString(bytes);
             }
             catch
@@ -416,59 +871,130 @@ namespace RdpConsole
             }
         }
 
-        // Пріоритет: 1) власний пароль для цього підключення (у застосунку);
-        // 2) якщо власного немає, але Windows уже має збережені облікові дані для
-        // цього сервера (Диспетчер облікових даних) -- нічого не підставляємо, mstsc
-        // сам ними скористається; 3) інакше -- пароль за замовчуванням із налаштувань.
-        public static string ResolveEffectivePassword(AppSettings settings, string entryFullPath)
+        // Пріоритет:
+        //  1) облікові дані Windows для цього сервера (TERMSRV/<хост>) -- нічого не
+        //     підставляємо, mstsc сам ними скористається;
+        //  2) власний пароль цього підключення;
+        //  3) пароль папки -- найближчої вгору по дереву від файлу;
+        //  4) пароль за замовчуванням -- для користувача з .rdp, інакше для будь-якого.
+        public static PasswordInfo Resolve(AppSettings s, RdpEntry e)
         {
-            string encrypted;
-            if (settings.EncryptedPasswords != null &&
-                settings.EncryptedPasswords.TryGetValue(entryFullPath, out encrypted) &&
-                !string.IsNullOrEmpty(encrypted))
+            if (WindowsCredentialStore.HasStoredCredential(e.HostName))
             {
-                return Decrypt(encrypted);
+                return new PasswordInfo
+                {
+                    Source = PasswordSource.Windows,
+                    Description = "Облікові дані Windows (TERMSRV/" + e.HostName + ")"
+                };
             }
 
-            var hostname = StripPort(ExtractFullAddress(entryFullPath));
-            if (WindowsCredentialStore.HasStoredCredential(hostname))
+            SavedCredential own;
+            if (s.FilePasswords.TryGetValue(e.RelativePath, out own) && !string.IsNullOrEmpty(own.Password))
             {
-                return null;
+                return new PasswordInfo { Source = PasswordSource.File, Password = own.Password, Description = "Власний пароль підключення" };
             }
 
-            encrypted = settings.DefaultEncryptedPassword;
-            return string.IsNullOrEmpty(encrypted) ? null : Decrypt(encrypted);
+            var folder = e.FolderKey;
+            while (folder.Length > 0)
+            {
+                string folderPwd;
+                if (s.FolderPasswords.TryGetValue(folder, out folderPwd) && !string.IsNullOrEmpty(folderPwd))
+                {
+                    return new PasswordInfo { Source = PasswordSource.Folder, Password = folderPwd, Description = "Пароль папки \"" + folder + "\"" };
+                }
+                var idx = folder.LastIndexOf('\\');
+                folder = idx < 0 ? "" : folder.Substring(0, idx);
+            }
+
+            var def = FindDefault(s, e.User);
+            if (def != null)
+            {
+                return new PasswordInfo
+                {
+                    Source = PasswordSource.Default,
+                    Password = def.Password,
+                    Description = "За замовчуванням (" + (string.IsNullOrWhiteSpace(def.User) ? "будь-який користувач" : def.User.Trim()) + ")"
+                };
+            }
+
+            return new PasswordInfo { Source = PasswordSource.None, Description = "Пароль не задано" };
         }
 
-        static string ExtractFullAddress(string rdpFilePath)
+        // Спершу точний збіг користувача; далі -- запис без домену ("admin") збігається з
+        // "SERVER\admin" чи "admin@domain"; наостанок -- запис із порожнім користувачем.
+        static DefaultCredential FindDefault(AppSettings s, string user)
         {
-            try
+            var list = s.DefaultCredentials.Where(d => !string.IsNullOrEmpty(d.Password)).ToList();
+            user = (user ?? "").Trim();
+            if (user.Length > 0)
             {
-                const string prefix = "full address:s:";
-                foreach (var line in File.ReadLines(rdpFilePath))
+                var exact = list.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d.User) &&
+                    string.Equals(d.User.Trim(), user, StringComparison.OrdinalIgnoreCase));
+                if (exact != null) return exact;
+
+                var shortName = ShortUserName(user);
+                var byShort = list.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d.User) &&
+                    d.User.IndexOf('\\') < 0 && d.User.IndexOf('@') < 0 &&
+                    string.Equals(d.User.Trim(), shortName, StringComparison.OrdinalIgnoreCase));
+                if (byShort != null) return byShort;
+            }
+            return list.FirstOrDefault(d => string.IsNullOrWhiteSpace(d.User));
+        }
+
+        static string ShortUserName(string user)
+        {
+            var idx = user.LastIndexOf('\\');
+            if (idx >= 0) user = user.Substring(idx + 1);
+            var at = user.IndexOf('@');
+            if (at > 0) user = user.Substring(0, at);
+            return user;
+        }
+
+        public static void SetFilePassword(AppSettings s, RdpEntry e, string password)
+        {
+            s.FilePasswords[e.RelativePath] = new SavedCredential { Host = e.Host, User = e.User, Password = password };
+        }
+
+        // Звіряє збережені паролі файлів зі щойно просканованими .rdp:
+        //  - оновлює запам'ятовані адресу/користувача, якщо їх змінили у файлі;
+        //  - пароль файлу, якого вже немає (перейменовано/перенесено), переносить на файл
+        //    з тією самою адресою й користувачем -- якщо такий файл рівно один і він ще
+        //    не має власного пароля. Паролі зниклих файлів не видаляються.
+        // true -- щось змінилося і налаштування треба зберегти.
+        public static bool Reconcile(AppSettings s, List<RdpEntry> entries)
+        {
+            if (entries.Count == 0) return false;
+            bool changed = false;
+            var byRel = new Dictionary<string, RdpEntry>(StringComparer.OrdinalIgnoreCase);
+            foreach (var e in entries) byRel[e.RelativePath] = e;
+
+            foreach (var kv in s.FilePasswords)
+            {
+                RdpEntry e;
+                if (!byRel.TryGetValue(kv.Key, out e)) continue;
+                if (!string.Equals(kv.Value.Host ?? "", e.Host, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(kv.Value.User ?? "", e.User, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (line.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return line.Substring(prefix.Length).Trim();
-                    }
+                    kv.Value.Host = e.Host;
+                    kv.Value.User = e.User;
+                    changed = true;
                 }
             }
-            catch { }
-            return null;
-        }
 
-        // Диспетчер облікових даних зберігає ціль без порту ("TERMSRV/<хост>"),
-        // тоді як "full address" у .rdp може містити "хост:порт" -- прибираємо порт.
-        static string StripPort(string address)
-        {
-            if (string.IsNullOrEmpty(address)) return address;
-            var idx = address.LastIndexOf(':');
-            if (idx > 0 && idx < address.Length - 1)
+            var orphans = s.FilePasswords.Where(kv => !byRel.ContainsKey(kv.Key) && !string.IsNullOrEmpty(kv.Value.Host)).ToList();
+            foreach (var kv in orphans)
             {
-                int port;
-                if (int.TryParse(address.Substring(idx + 1), out port)) return address.Substring(0, idx);
+                var candidates = entries.Where(e =>
+                    !s.FilePasswords.ContainsKey(e.RelativePath) &&
+                    string.Equals(e.Host, kv.Value.Host, StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(e.User, kv.Value.User ?? "", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (candidates.Count != 1) continue;
+
+                s.FilePasswords.Remove(kv.Key);
+                s.FilePasswords[candidates[0].RelativePath] = kv.Value;
+                changed = true;
             }
-            return address;
+            return changed;
         }
     }
 
@@ -477,6 +1003,42 @@ namespace RdpConsole
         public string FullPath;
         public string DisplayName;
         public string RelativeFolder;
+        // Шлях файлу відносно кореневої папки ("Клієнт\сервер.rdp") -- ключ пароля файлу.
+        public string RelativePath;
+        // Відносний шлях папки файлу; "" -- корінь.
+        public string FolderKey;
+        // "full address" і "username" з самого .rdp.
+        public string Host = "";
+        public string User = "";
+
+        // Адреса без порту -- саме так mstsc називає записи в Диспетчері облікових даних.
+        public string HostName
+        {
+            get
+            {
+                var address = Host;
+                if (string.IsNullOrEmpty(address)) return address;
+                var idx = address.LastIndexOf(':');
+                if (idx > 0 && idx < address.Length - 1)
+                {
+                    int port;
+                    if (int.TryParse(address.Substring(idx + 1), out port)) return address.Substring(0, idx);
+                }
+                return address;
+            }
+        }
+
+        public void RefreshConnectionInfo()
+        {
+            try
+            {
+                string host, user;
+                RdpFileEditor.Read(FullPath, out host, out user);
+                Host = host ?? "";
+                User = user ?? "";
+            }
+            catch { }
+        }
 
         public override string ToString()
         {
@@ -484,8 +1046,21 @@ namespace RdpConsole
         }
     }
 
+    // Вузол папки в дереві (Tag) -- для контекстного меню "пароль папки".
+    public class RdpFolder
+    {
+        public string RelativePath;
+    }
+
     public static class RdpScanner
     {
+        public static string MakeRelative(string root, string fullPath)
+        {
+            if (string.IsNullOrWhiteSpace(root) || string.IsNullOrEmpty(fullPath)) return null;
+            root = root.TrimEnd('\\', '/') + "\\";
+            return fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) ? fullPath.Substring(root.Length) : null;
+        }
+
         public static List<RdpEntry> Scan(string root)
         {
             var result = new List<RdpEntry>();
@@ -499,12 +1074,16 @@ namespace RdpConsole
             {
                 var rel = f.Length > root.Length ? f.Substring(root.Length).TrimStart('\\', '/') : Path.GetFileName(f);
                 var dir = Path.GetDirectoryName(rel);
-                result.Add(new RdpEntry
+                var entry = new RdpEntry
                 {
                     FullPath = f,
                     DisplayName = Path.GetFileNameWithoutExtension(f),
-                    RelativeFolder = string.IsNullOrEmpty(dir) ? "(корінь)" : dir
-                });
+                    RelativeFolder = string.IsNullOrEmpty(dir) ? "(корінь)" : dir,
+                    RelativePath = rel,
+                    FolderKey = dir ?? ""
+                };
+                entry.RefreshConnectionInfo();
+                result.Add(entry);
             }
 
             return result
@@ -714,7 +1293,8 @@ namespace RdpConsole
     // пошуку з трея, щоб не дублювати логіку.
     public static class RdpTreeBuilder
     {
-        public static void Populate(TreeView tree, List<RdpEntry> entries, Func<RdpEntry, string> formatLabel)
+        public static void Populate(TreeView tree, List<RdpEntry> entries, Func<RdpEntry, string> formatLabel,
+            Func<string, string, string> formatFolder = null)
         {
             tree.BeginUpdate();
             tree.Nodes.Clear();
@@ -732,12 +1312,12 @@ namespace RdpConsole
                 list.Add(entry);
             }
 
-            AddLevel(tree.Nodes, "", byFolder, formatLabel);
+            AddLevel(tree.Nodes, "", byFolder, formatLabel, formatFolder);
             tree.EndUpdate();
         }
 
         static void AddLevel(TreeNodeCollection parentNodes, string currentPath, Dictionary<string, List<RdpEntry>> byFolder,
-            Func<RdpEntry, string> formatLabel)
+            Func<RdpEntry, string> formatLabel, Func<string, string, string> formatFolder)
         {
             var directSubfolders = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var key in byFolder.Keys)
@@ -766,13 +1346,14 @@ namespace RdpConsole
             foreach (var subfolderPath in directSubfolders)
             {
                 var name = subfolderPath.Substring(subfolderPath.LastIndexOf('\\') + 1);
-                var node = new TreeNode(name)
+                var node = new TreeNode(formatFolder != null ? formatFolder(subfolderPath, name) : name)
                 {
                     ImageIndex = ShellIcons.FolderImageIndex,
-                    SelectedImageIndex = ShellIcons.FolderImageIndex
+                    SelectedImageIndex = ShellIcons.FolderImageIndex,
+                    Tag = new RdpFolder { RelativePath = subfolderPath }
                 };
                 parentNodes.Add(node);
-                AddLevel(node.Nodes, subfolderPath, byFolder, formatLabel);
+                AddLevel(node.Nodes, subfolderPath, byFolder, formatLabel, formatFolder);
             }
 
             List<RdpEntry> filesHere;
@@ -940,13 +1521,29 @@ namespace RdpConsole
             {
                 try
                 {
-                    var pwd = PasswordManager.ResolveEffectivePassword(settings, t.FullPath);
-                    if (!string.IsNullOrEmpty(pwd))
+                    // Адресу/користувача могли змінити у файлі після сканування.
+                    t.RefreshConnectionInfo();
+                    var info = PasswordManager.Resolve(settings, t);
+                    var pwd = info.Password;
+                    bool credentialsReady = info.Source == PasswordSource.Windows;
+
+                    // Опція "записувати в облікові дані Windows": пароль іде в Диспетчер
+                    // облікових даних замість тимчасового файлу; далі для цього сервера
+                    // діє пріоритет облікових даних Windows. Без користувача в .rdp запис
+                    // неможливий -- тоді, як і без опції, пароль іде у файл.
+                    if (!string.IsNullOrEmpty(pwd) && settings.StoreInWindowsCredentials &&
+                        !string.IsNullOrEmpty(t.HostName) && !string.IsNullOrEmpty(t.User))
                     {
-                        try { Clipboard.SetText(pwd); } catch { }
+                        try
+                        {
+                            WindowsCredentialStore.Write(t.HostName, t.User, pwd);
+                            pwd = null;
+                            credentialsReady = true;
+                        }
+                        catch { }
                     }
 
-                    var connectPath = PrepareConnectionFile(t.FullPath, pwd);
+                    var connectPath = PrepareConnectionFile(t.FullPath, pwd, credentialsReady);
                     var psi = new ProcessStartInfo("mstsc.exe", "\"" + connectPath + "\"");
                     psi.UseShellExecute = true;
                     Process.Start(psi);
@@ -1005,7 +1602,9 @@ namespace RdpConsole
         // примусово вмикає дозволи з ForceEnabledKeys і, якщо є збережений пароль, дописує
         // його як "password 51:b:..." -- той самий формат, який mstsc сам розуміє без
         // жодного запиту облікових даних. Оригінальний файл не змінюється.
-        static string PrepareConnectionFile(string originalPath, string password)
+        // credentialsReady -- облікові дані для сервера вже є в Windows: пароль у файл не
+        // пишемо, але запит облікових даних так само вимикаємо.
+        static string PrepareConnectionFile(string originalPath, string password, bool credentialsReady)
         {
             try
             {
@@ -1031,7 +1630,7 @@ namespace RdpConsole
                     if (!seen.Contains(forceKey)) lines.Add(forceKey + ":i:1");
                 }
 
-                if (!string.IsNullOrEmpty(password))
+                if (!string.IsNullOrEmpty(password) || credentialsReady)
                 {
                     // "prompt for credentials:i:1" (типове значення в багатьох .rdp) змушує
                     // mstsc показати діалог входу НАВІТЬ якщо пароль уже вбудовано у файл --
@@ -1042,7 +1641,7 @@ namespace RdpConsole
                     lines.RemoveAll(l =>
                         l.StartsWith("password 51:b:", StringComparison.OrdinalIgnoreCase) ||
                         l.StartsWith("prompt for credentials:", StringComparison.OrdinalIgnoreCase));
-                    lines.Add("password 51:b:" + EncryptForMstsc(password));
+                    if (!string.IsNullOrEmpty(password)) lines.Add("password 51:b:" + EncryptForMstsc(password));
                     lines.Add("prompt for credentials:i:0");
                 }
 
@@ -1118,6 +1717,116 @@ namespace RdpConsole
                 UseShellExecute = false
             };
             Process.Start(psi);
+        }
+    }
+
+    // Пункти контекстного меню для паролів і підписи з мітками джерела пароля --
+    // спільні для головного вікна та вікна швидкого пошуку з трея.
+    public static class PasswordMenu
+    {
+        // Підпис файлу в дереві/списку з міткою джерела пароля (W / ✓ / 📁 / •).
+        public static string EntryLabel(AppSettings s, RdpEntry entry, string text)
+        {
+            var marker = PasswordManager.Resolve(s, entry).Marker;
+            return marker.Length == 0 ? text : text + "   " + marker;
+        }
+
+        // Мітка папки з власним паролем у дереві.
+        public static string FolderLabel(AppSettings s, string folderKey, string name)
+        {
+            return HasFolderPassword(s, folderKey) ? name + "   🔑" : name;
+        }
+
+        public static bool HasFolderPassword(AppSettings s, string folderKey)
+        {
+            return !string.IsNullOrEmpty(folderKey) && s.FolderPasswords.ContainsKey(folderKey);
+        }
+
+        // runModal -- обгортка для діалогів (вікно швидкого пошуку на цей час вимикає
+        // автозакриття при втраті фокуса); onChanged -- оновити відображення.
+        public static void AddEntryItems(ToolStripItemCollection items, IWin32Window owner, AppSettings s, RdpEntry t,
+            Action<Action> runModal, Action onChanged)
+        {
+            bool hasOwn = s.FilePasswords.ContainsKey(t.RelativePath);
+
+            var miPwd = new ToolStripMenuItem(hasOwn ? "Змінити пароль підключення..." : "Зберегти пароль підключення...");
+            miPwd.Click += (o, ev) => runModal(() =>
+            {
+                using (var dlg = new PasswordDialog("Пароль для \"" + t.DisplayName + "\"", s.Theme))
+                {
+                    if (dlg.ShowDialog(owner) != DialogResult.OK) return;
+                    t.RefreshConnectionInfo();
+                    Change(s, () => PasswordManager.SetFilePassword(s, t, dlg.Password), onChanged);
+                }
+            });
+            items.Add(miPwd);
+
+            if (hasOwn)
+            {
+                var miDel = new ToolStripMenuItem("Видалити пароль підключення");
+                miDel.Click += (o, ev) => Change(s, () => s.FilePasswords.Remove(t.RelativePath), onChanged);
+                items.Add(miDel);
+            }
+
+            if (t.FolderKey.Length > 0)
+            {
+                AddFolderItems(items, owner, s, t.FolderKey, true, runModal, onChanged);
+            }
+
+            // Облікові дані Windows мають найвищий пріоритет, тож застарілий запис у
+            // Диспетчері облікових даних перекриває паролі застосунку -- його можна прибрати.
+            if (WindowsCredentialStore.HasStoredCredential(t.HostName))
+            {
+                var miDelWin = new ToolStripMenuItem("Видалити облікові дані Windows (TERMSRV/" + t.HostName + ")");
+                miDelWin.Click += (o, ev) => runModal(() =>
+                {
+                    var r = MessageBox.Show(owner,
+                        "Видалити збережені облікові дані Windows для \"" + t.HostName + "\"?\n\n" +
+                        "Після цього при підключенні діятиме пароль із застосунку (якщо він є).",
+                        "Облікові дані Windows", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (r != DialogResult.Yes) return;
+                    WindowsCredentialStore.Delete(t.HostName);
+                    onChanged();
+                });
+                items.Add(miDelWin);
+            }
+        }
+
+        // Пункти "пароль папки": на самій папці в дереві або (withFolderName) у меню файлу --
+        // для папки, де цей файл лежить.
+        public static void AddFolderItems(ToolStripItemCollection items, IWin32Window owner, AppSettings s, string folderKey,
+            bool withFolderName, Action<Action> runModal, Action onChanged)
+        {
+            var suffix = withFolderName ? " \"" + folderKey + "\"" : "";
+            bool has = HasFolderPassword(s, folderKey);
+
+            var miSet = new ToolStripMenuItem((has ? "Змінити пароль папки" : "Зберегти пароль папки") + suffix + "...");
+            miSet.Click += (o, ev) => runModal(() =>
+            {
+                using (var dlg = new PasswordDialog("Пароль папки \"" + folderKey + "\"", s.Theme))
+                {
+                    if (dlg.ShowDialog(owner) != DialogResult.OK) return;
+                    Change(s, () => s.FolderPasswords[folderKey] = dlg.Password, onChanged);
+                }
+            });
+            items.Add(miSet);
+
+            if (has)
+            {
+                var miDel = new ToolStripMenuItem("Видалити пароль папки" + suffix);
+                miDel.Click += (o, ev) => Change(s, () => s.FolderPasswords.Remove(folderKey), onChanged);
+                items.Add(miDel);
+            }
+        }
+
+        // Зміна спільних налаштувань: спершу підтягуємо свіжу версію файлу (щоб не затерти
+        // зміни, зроблені на іншому ПК), потім застосовуємо зміну й зберігаємо.
+        static void Change(AppSettings s, Action change, Action onChanged)
+        {
+            SettingsManager.ReloadShared(s, true);
+            change();
+            SettingsManager.SaveShared(s);
+            onChanged();
         }
     }
 
@@ -1232,7 +1941,9 @@ namespace RdpConsole
         // Відкриває окреме легке вікно швидкого пошуку біля курсора.
         void OpenTraySearch()
         {
+            RefreshIfSharedSettingsChanged();
             var form = new TraySearchForm(allEntries, settings, this, () => ExitApplication());
+            form.FormClosed += (s, e) => { if (form.PasswordsChanged && !IsDisposed) ApplyFilter(); };
 
             var screen = Screen.FromPoint(Cursor.Position).WorkingArea;
             int x = Math.Min(Cursor.Position.X, screen.Right - form.Width - 4);
@@ -1259,6 +1970,33 @@ namespace RdpConsole
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
+            RefreshIfSharedSettingsChanged();
+        }
+
+        // Спільний файл налаштувань міг змінитися з іншого ПК (Google Drive) -- тоді
+        // перечитуємо його й оновлюємо список, тему та гарячу клавішу.
+        void RefreshIfSharedSettingsChanged()
+        {
+            uint oldMods = settings.HotkeyModifiers, oldKey = settings.HotkeyKey;
+            if (!SettingsManager.ReloadShared(settings, true)) return;
+
+            ApplyFilter();
+            ApplyTheme();
+            if (oldMods != settings.HotkeyModifiers || oldKey != settings.HotkeyKey)
+            {
+                UnregisterGlobalHotkey();
+                RegisterGlobalHotkey();
+            }
+        }
+
+        // Зміна спільних налаштувань: спершу підтягуємо свіжу версію файлу (щоб не затерти
+        // зміни, зроблені на іншому ПК), потім застосовуємо зміну й зберігаємо.
+        void UpdateShared(Action change)
+        {
+            SettingsManager.ReloadShared(settings, true);
+            change();
+            SettingsManager.SaveShared(settings);
+            ApplyFilter();
         }
 
         void ExitApplication()
@@ -1348,12 +2086,7 @@ namespace RdpConsole
             btnExit.Click += (s, e) => ExitApplication();
 
             btnViewMode = new Button { Dock = DockStyle.Right, Width = 100, Margin = new Padding(4, 0, 0, 0) };
-            btnViewMode.Click += (s, e) =>
-            {
-                settings.HierarchyView = !settings.HierarchyView;
-                SettingsManager.Save(settings);
-                ApplyFilter();
-            };
+            btnViewMode.Click += (s, e) => UpdateShared(() => settings.HierarchyView = !settings.HierarchyView);
 
             topPanel.Controls.Add(txtSearch);
             topPanel.Controls.Add(lnkVersion);
@@ -1371,7 +2104,8 @@ namespace RdpConsole
                 HideSelection = false,
                 MultiSelect = true,
                 GridLines = true,
-                ShowGroups = true
+                ShowGroups = true,
+                ShowItemToolTips = true
             };
             listView.Columns.Add("Назва підключення", 700);
             listView.Columns.Add("Пароль", 90);
@@ -1405,7 +2139,7 @@ namespace RdpConsole
             {
                 if (e.Button != MouseButtons.Right) return;
                 treeView.SelectedNode = e.Node;
-                if (e.Node.Tag is RdpEntry) itemMenu.Show(treeView, e.Location);
+                if (e.Node.Tag is RdpEntry || e.Node.Tag is RdpFolder) itemMenu.Show(treeView, e.Location);
             };
             treeView.KeyDown += (s, e) =>
             {
@@ -1556,6 +2290,11 @@ namespace RdpConsole
             if (loaded) return;
             loaded = true;
             AutostartManager.RefreshPathIfEnabled();
+            if (SettingsManager.LoadError != null)
+            {
+                MessageBox.Show(this, SettingsManager.LoadError, "Консоль підключення по RDP",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             EnsureRootFolder();
             RescanAndFill();
             RegisterGlobalHotkey();
@@ -1769,34 +2508,18 @@ namespace RdpConsole
                 if (fbd.ShowDialog(this) == DialogResult.OK)
                 {
                     settings.RootFolder = fbd.SelectedPath;
-                    SettingsManager.Save(settings);
+                    SettingsManager.SaveLocal(settings);
                 }
             }
         }
 
         void RescanAndFill()
         {
+            SettingsManager.ReloadShared(settings, true);
+            WindowsCredentialStore.ClearCache();
             allEntries = RdpScanner.Scan(settings.RootFolder);
+            if (PasswordManager.Reconcile(settings, allEntries)) SettingsManager.SaveShared(settings);
             ApplyFilter();
-        }
-
-        bool HasOwnPassword(RdpEntry entry)
-        {
-            return settings.EncryptedPasswords != null && settings.EncryptedPasswords.ContainsKey(entry.FullPath);
-        }
-
-        bool HasEffectivePassword(RdpEntry entry)
-        {
-            return HasOwnPassword(entry) || !string.IsNullOrEmpty(settings.DefaultEncryptedPassword);
-        }
-
-        // "✓" -- для цього підключення збережено власний пароль;
-        // "•" -- власного немає, але спрацює пароль за замовчуванням.
-        string PasswordMarker(RdpEntry entry)
-        {
-            if (HasOwnPassword(entry)) return "✓";
-            if (!string.IsNullOrEmpty(settings.DefaultEncryptedPassword)) return "•";
-            return "";
         }
 
         void ApplyFilter()
@@ -1850,11 +2573,12 @@ namespace RdpConsole
                     groups[entry.RelativeFolder] = g;
                     listView.Groups.Add(g);
                 }
+                var pwdInfo = PasswordManager.Resolve(settings, entry);
                 var item = new ListViewItem(entry.DisplayName);
-                item.SubItems.Add(PasswordMarker(entry));
+                item.SubItems.Add(pwdInfo.Marker);
                 item.Tag = entry;
                 item.Group = g;
-                item.ToolTipText = entry.FullPath;
+                item.ToolTipText = entry.FullPath + "\nПароль: " + pwdInfo.Description;
                 var themeColors = ThemeManager.Get(settings.Theme);
                 item.BackColor = (shown % 2 == 1) ? themeColors.ZebraStripe : themeColors.ControlBack;
                 item.ForeColor = themeColors.ControlFore;
@@ -1870,11 +2594,9 @@ namespace RdpConsole
         // (за абеткою), потім файли цього рівня (за абеткою) -- "папки зверху".
         int BuildHierarchyTree()
         {
-            RdpTreeBuilder.Populate(treeView, allEntries, entry =>
-            {
-                var marker = PasswordMarker(entry);
-                return marker.Length == 0 ? entry.DisplayName : entry.DisplayName + "   " + marker;
-            });
+            RdpTreeBuilder.Populate(treeView, allEntries,
+                entry => PasswordMenu.EntryLabel(settings, entry, entry.DisplayName),
+                (key, name) => PasswordMenu.FolderLabel(settings, key, name));
             return allEntries.Count;
         }
 
@@ -1986,9 +2708,17 @@ namespace RdpConsole
 
         void ItemMenu_Opening(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            var targets = SelectedEntries();
             itemMenu.Items.Clear();
 
+            // ПКМ на папці в дереві -- лише керування паролем папки.
+            var folder = treeView.Visible && treeView.SelectedNode != null ? treeView.SelectedNode.Tag as RdpFolder : null;
+            if (folder != null)
+            {
+                PasswordMenu.AddFolderItems(itemMenu.Items, this, settings, folder.RelativePath, false, a => a(), ApplyFilter);
+                return;
+            }
+
+            var targets = SelectedEntries();
             if (targets.Count == 0)
             {
                 e.Cancel = true;
@@ -2005,28 +2735,18 @@ namespace RdpConsole
             if (targets.Count == 1)
             {
                 var t = targets[0];
-                bool hasOwnPwd = HasOwnPassword(t);
 
                 var miConn = new ToolStripMenuItem("Комп'ютер / користувач...");
-                miConn.Click += (s, ev) => ConnectionEditor.Edit(this, t, settings.Theme);
+                miConn.Click += (s, ev) =>
+                {
+                    ConnectionEditor.Edit(this, t, settings.Theme);
+                    RescanAndFill();
+                };
                 itemMenu.Items.Add(miConn);
 
                 itemMenu.Items.Add(new ToolStripSeparator());
 
-                var miPwd = new ToolStripMenuItem(hasOwnPwd ? "Змінити пароль..." : "Зберегти пароль...");
-                miPwd.Click += (s, ev) => SavePasswordFor(t);
-                itemMenu.Items.Add(miPwd);
-
-                var miCopyPwd = new ToolStripMenuItem("Копіювати пароль") { Enabled = HasEffectivePassword(t) };
-                miCopyPwd.Click += (s, ev) => CopyPasswordFor(t);
-                itemMenu.Items.Add(miCopyPwd);
-
-                if (hasOwnPwd)
-                {
-                    var miDelPwd = new ToolStripMenuItem("Видалити пароль");
-                    miDelPwd.Click += (s, ev) => DeletePasswordFor(t);
-                    itemMenu.Items.Add(miDelPwd);
-                }
+                PasswordMenu.AddEntryItems(itemMenu.Items, this, settings, t, a => a(), ApplyFilter);
 
                 itemMenu.Items.Add(new ToolStripSeparator());
 
@@ -2048,56 +2768,67 @@ namespace RdpConsole
             }
         }
 
-        void SavePasswordFor(RdpEntry entry)
-        {
-            using (var dlg = new PasswordDialog(entry.DisplayName, settings.Theme))
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    if (settings.EncryptedPasswords == null) settings.EncryptedPasswords = new Dictionary<string, string>();
-                    settings.EncryptedPasswords[entry.FullPath] = PasswordManager.Encrypt(dlg.Password);
-                    SettingsManager.Save(settings);
-                    ApplyFilter();
-                }
-            }
-        }
-
-        void CopyPasswordFor(RdpEntry entry)
-        {
-            var pwd = PasswordManager.ResolveEffectivePassword(settings, entry.FullPath);
-            if (string.IsNullOrEmpty(pwd)) return;
-
-            try { Clipboard.SetText(pwd); } catch { }
-        }
-
-        void DeletePasswordFor(RdpEntry entry)
-        {
-            if (settings.EncryptedPasswords == null) return;
-            if (settings.EncryptedPasswords.Remove(entry.FullPath))
-            {
-                SettingsManager.Save(settings);
-                ApplyFilter();
-            }
-        }
-
         void OpenSettings()
         {
+            SettingsManager.ReloadShared(settings, true);
             using (var f = new SettingsForm(settings))
             {
-                if (f.ShowDialog(this) == DialogResult.OK)
-                {
-                    bool hotkeyChanged = settings.HotkeyModifiers != f.ResultSettings.HotkeyModifiers ||
-                                          settings.HotkeyKey != f.ResultSettings.HotkeyKey;
-                    settings = f.ResultSettings;
-                    SettingsManager.Save(settings);
-                    RescanAndFill();
-                    ApplyTheme();
+                if (f.ShowDialog(this) != DialogResult.OK) return;
 
-                    if (hotkeyChanged)
+                bool hotkeyChanged = settings.HotkeyModifiers != f.ResultSettings.HotkeyModifiers ||
+                                      settings.HotkeyKey != f.ResultSettings.HotkeyKey;
+                var oldSharedPath = SettingsManager.SharedPath(settings);
+                var oldFolder = settings.SettingsFolder;
+                settings = f.ResultSettings;
+
+                bool saveShared = true;
+                bool forceOverwrite = false;
+                var newSharedPath = SettingsManager.SharedPath(settings);
+                if (!string.Equals(oldSharedPath, newSharedPath, StringComparison.OrdinalIgnoreCase) && File.Exists(newSharedPath))
+                {
+                    var r = MessageBox.Show(this,
+                        "У вибраній папці вже є файл налаштувань (наприклад, з іншого ПК):\n" + newSharedPath + "\n\n" +
+                        "Так -- завантажити його (паролі й налаштування на цьому ПК буде замінено ним).\n" +
+                        "Ні -- перезаписати його поточними налаштуваннями цього ПК.\n" +
+                        "Скасувати -- лишити попередню папку.",
+                        "Папка налаштувань", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                    if (r == DialogResult.No)
                     {
-                        UnregisterGlobalHotkey();
-                        RegisterGlobalHotkey();
+                        forceOverwrite = true;
                     }
+                    else if (r == DialogResult.Cancel)
+                    {
+                        settings.SettingsFolder = oldFolder;
+                    }
+                    else if (r == DialogResult.Yes)
+                    {
+                        if (SettingsManager.ReloadShared(settings, false))
+                        {
+                            saveShared = false;
+                            hotkeyChanged = true;
+                        }
+                        else
+                        {
+                            MessageBox.Show(this, "Не вдалося прочитати цей файл -- лишаємо попередню папку.",
+                                "Папка налаштувань", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            settings.SettingsFolder = oldFolder;
+                        }
+                    }
+                }
+
+                SettingsManager.SaveLocal(settings);
+                if (saveShared && !SettingsManager.SaveShared(settings, forceOverwrite))
+                {
+                    MessageBox.Show(this, "Не вдалося записати файл налаштувань:\n" + SettingsManager.SharedPath(settings),
+                        "Налаштування", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                RescanAndFill();
+                ApplyTheme();
+
+                if (hotkeyChanged)
+                {
+                    UnregisterGlobalHotkey();
+                    RegisterGlobalHotkey();
                 }
             }
         }
@@ -2116,7 +2847,7 @@ namespace RdpConsole
                 settings.WindowWidth = Width;
                 settings.WindowHeight = Height;
             }
-            SettingsManager.Save(settings);
+            SettingsManager.SaveLocal(settings);
             trayIcon.Visible = false;
             UnregisterGlobalHotkey();
         }
@@ -2157,6 +2888,9 @@ namespace RdpConsole
         // Поки відкрито контекстне меню або діалог редагування, вікно втрачає фокус --
         // це не привід закривати його (інакше воно зникне разом із діалогом).
         bool suppressClose;
+
+        // Паролі змінено з цього вікна -- головне вікно оновить свій список після закриття.
+        public bool PasswordsChanged { get; private set; }
 
         const int EdgeMargin = 8;
 
@@ -2232,7 +2966,7 @@ namespace RdpConsole
             {
                 treeMode = !treeMode;
                 settings.HierarchyView = treeMode;
-                SettingsManager.Save(settings);
+                SettingsManager.SaveShared(settings);
                 UpdateToggleButtonText();
                 RefreshResults();
             };
@@ -2247,6 +2981,12 @@ namespace RdpConsole
                 Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right
             };
             lstResults.KeyDown += LstResults_KeyDown;
+            lstResults.FormattingEnabled = true;
+            lstResults.Format += (s, e) =>
+            {
+                var entry = e.ListItem as RdpEntry;
+                if (entry != null) e.Value = PasswordMenu.EntryLabel(settings, entry, entry.ToString());
+            };
             lstResults.MouseDoubleClick += (s, e) => ConnectSelected();
 
             treeResults = new TreeView
@@ -2339,7 +3079,9 @@ namespace RdpConsole
 
             if (useTree)
             {
-                RdpTreeBuilder.Populate(treeResults, allEntries, null);
+                RdpTreeBuilder.Populate(treeResults, allEntries,
+                    entry => PasswordMenu.EntryLabel(settings, entry, entry.DisplayName),
+                    (key, name) => PasswordMenu.FolderLabel(settings, key, name));
                 if (treeResults.Nodes.Count > 0) treeResults.SelectedNode = treeResults.Nodes[0];
                 return;
             }
@@ -2446,6 +3188,16 @@ namespace RdpConsole
         {
             var entry = SelectedEntry();
             resultMenu.Items.Clear();
+
+            // ПКМ на папці в дереві -- лише керування паролем папки.
+            var folder = treeResults.Visible && treeResults.SelectedNode != null ? treeResults.SelectedNode.Tag as RdpFolder : null;
+            if (folder != null)
+            {
+                suppressClose = true;
+                PasswordMenu.AddFolderItems(resultMenu.Items, this, settings, folder.RelativePath, false, RunModal, OnPasswordsChanged);
+                return;
+            }
+
             if (entry == null)
             {
                 e.Cancel = true;
@@ -2467,6 +3219,56 @@ namespace RdpConsole
                 finally { suppressClose = false; }
             };
             resultMenu.Items.Add(miEdit);
+
+            resultMenu.Items.Add(new ToolStripSeparator());
+            PasswordMenu.AddEntryItems(resultMenu.Items, this, settings, entry, RunModal, OnPasswordsChanged);
+        }
+
+        // Діалог із меню забирає фокус -- на цей час вимикаємо автозакриття вікна.
+        void RunModal(Action action)
+        {
+            suppressClose = true;
+            try { action(); }
+            finally { suppressClose = false; }
+        }
+
+        // Оновлюємо лише підписи (мітки паролів), не перебудовуючи дерево -- щоб не
+        // згортались уже розгорнуті папки.
+        void OnPasswordsChanged()
+        {
+            PasswordsChanged = true;
+
+            // ListBox запам'ятовує текст рядка при додаванні (Format більше не викликається),
+            // тож перезаповнюємо ті самі елементи, зберігаючи виділення й прокрутку.
+            int selected = lstResults.SelectedIndex, top = lstResults.TopIndex;
+            var items = lstResults.Items.Cast<object>().ToArray();
+            lstResults.BeginUpdate();
+            lstResults.Items.Clear();
+            lstResults.Items.AddRange(items);
+            if (selected < lstResults.Items.Count) lstResults.SelectedIndex = selected;
+            if (top < lstResults.Items.Count) lstResults.TopIndex = top;
+            lstResults.EndUpdate();
+
+            UpdateNodeLabels(treeResults.Nodes);
+        }
+
+        void UpdateNodeLabels(TreeNodeCollection nodes)
+        {
+            foreach (TreeNode node in nodes)
+            {
+                var entry = node.Tag as RdpEntry;
+                var folder = node.Tag as RdpFolder;
+                if (entry != null)
+                {
+                    node.Text = PasswordMenu.EntryLabel(settings, entry, entry.DisplayName);
+                }
+                else if (folder != null)
+                {
+                    var name = folder.RelativePath.Substring(folder.RelativePath.LastIndexOf('\\') + 1);
+                    node.Text = PasswordMenu.FolderLabel(settings, folder.RelativePath, name);
+                }
+                UpdateNodeLabels(node.Nodes);
+            }
         }
 
         // Закрите меню (вибір пункту, Esc або клік повз нього) знову вмикає звичайну
@@ -2485,34 +3287,49 @@ namespace RdpConsole
         }
     }
 
+    // Діалог введення пароля. withUser -- додатково поле "Користувач" (облікові дані за
+    // замовчуванням у Налаштуваннях; порожній користувач -- для будь-якого).
     public class PasswordDialog : Form
     {
         public string Password;
+        public string User;
 
+        TextBox txtUser;
         TextBox txtPassword;
         CheckBox chkShow;
 
-        public PasswordDialog(string forName, string themeName)
+        public PasswordDialog(string title, string themeName, bool withUser = false, string user = "", string password = "")
         {
             AutoScaleMode = AutoScaleMode.None;
-            Text = "Пароль для \"" + forName + "\"";
+            Text = title;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
+            ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
             Width = 380;
-            Height = 170;
             Font = new Font("Segoe UI", 9.5f);
 
-            var lbl = new Label { Text = "Пароль:", Left = 12, Top = 16, Width = 340 };
-            txtPassword = new TextBox { Left = 12, Top = 38, Width = 340, UseSystemPasswordChar = true };
+            int top = 16;
+            if (withUser)
+            {
+                var lblUser = new Label { Text = "Користувач (порожньо -- для будь-якого):", Left = 12, Top = top, Width = 340 };
+                txtUser = new TextBox { Left = 12, Top = top + 22, Width = 340, Text = user ?? "" };
+                Controls.Add(lblUser);
+                Controls.Add(txtUser);
+                top += 54;
+            }
 
-            chkShow = new CheckBox { Text = "Показати пароль", Left = 12, Top = 66, Width = 200 };
+            var lbl = new Label { Text = "Пароль:", Left = 12, Top = top, Width = 340 };
+            txtPassword = new TextBox { Left = 12, Top = top + 22, Width = 340, UseSystemPasswordChar = true, Text = password ?? "" };
+
+            chkShow = new CheckBox { Text = "Показати пароль", Left = 12, Top = top + 50, Width = 200 };
             chkShow.CheckedChanged += (s, e) => txtPassword.UseSystemPasswordChar = !chkShow.Checked;
 
-            var btnOk = new Button { Text = "Зберегти", Left = 172, Top = 96, Width = 85 };
+            var btnOk = new Button { Text = "Зберегти", Left = 172, Top = top + 80, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 264, Top = 96, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 264, Top = top + 80, Width = 85, DialogResult = DialogResult.Cancel };
+            Height = top + 154;
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -2525,7 +3342,7 @@ namespace RdpConsole
 
             ThemeManager.Apply(this, themeName);
 
-            Load += (s, e) => txtPassword.Focus();
+            Load += (s, e) => { if (txtUser != null) txtUser.Focus(); else txtPassword.Focus(); };
         }
 
         void Accept()
@@ -2536,6 +3353,7 @@ namespace RdpConsole
                 return;
             }
             Password = txtPassword.Text;
+            User = txtUser != null ? txtUser.Text.Trim() : null;
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -2629,6 +3447,7 @@ namespace RdpConsole
                 try
                 {
                     RdpFileEditor.Save(entry.FullPath, dlg.Address, dlg.User);
+                    entry.RefreshConnectionInfo();
                 }
                 catch (Exception ex)
                 {
@@ -2643,10 +3462,10 @@ namespace RdpConsole
         AppSettings working;
         public AppSettings ResultSettings;
 
+        const int RightCol = 476;
+
         TextBox txtRoot;
-        TextBox txtDefaultPassword;
-        CheckBox chkShowDefaultPassword;
-        CheckBox chkClearDefaultPassword;
+        ListView lvDefaults;
         TextBox txtHotkey;
         uint capturedHotkeyModifiers;
         uint capturedHotkeyVk;
@@ -2654,6 +3473,8 @@ namespace RdpConsole
         RadioButton radioThemeDark;
         RadioButton radioThemeBlue;
         CheckBox chkMica;
+        TextBox txtSettingsFolder;
+        CheckBox chkStoreInWindows;
         CheckBox chkAutostart;
         Label lblRdpWarningState;
         Button btnRdpWarning;
@@ -2661,15 +3482,15 @@ namespace RdpConsole
         public SettingsForm(AppSettings current)
         {
             AutoScaleMode = AutoScaleMode.None;
-            working = Clone(current);
+            working = current.Clone();
 
             Text = "Налаштування";
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            Width = 480;
-            Height = 670;
+            Width = 948;
+            Height = 572;
             Font = new Font("Segoe UI", 9.5f);
 
             capturedHotkeyModifiers = working.HotkeyModifiers;
@@ -2678,82 +3499,70 @@ namespace RdpConsole
             BuildUi();
         }
 
-        static AppSettings Clone(AppSettings s)
+        Label Hint(int left, int top, int height, string text)
         {
-            return new AppSettings
-            {
-                RootFolder = s.RootFolder,
-                WindowWidth = s.WindowWidth,
-                WindowHeight = s.WindowHeight,
-                DefaultEncryptedPassword = s.DefaultEncryptedPassword,
-                HierarchyView = s.HierarchyView,
-                HotkeyModifiers = s.HotkeyModifiers,
-                HotkeyKey = s.HotkeyKey,
-                Theme = s.Theme,
-                MicaEnabled = s.MicaEnabled,
-                EncryptedPasswords = s.EncryptedPasswords != null
-                    ? new Dictionary<string, string>(s.EncryptedPasswords)
-                    : new Dictionary<string, string>()
-            };
+            return new Label { Left = left, Top = top, Width = 440, Height = height, ForeColor = SystemColors.GrayText, Text = text };
         }
 
         void BuildUi()
         {
-            var lblRoot = new Label { Text = "Папка з файлами *.rdp:", Left = 12, Top = 14, Width = 300 };
+            // ---- Ліва колонка: папка з .rdp, облікові дані за замовчуванням, гаряча клавіша, тема ----
+            var lblRoot = new Label { Text = "Папка з файлами *.rdp (окремо для кожного ПК):", Left = 12, Top = 14, Width = 440 };
             txtRoot = new TextBox { Left = 12, Top = 36, Width = 340, Text = working.RootFolder };
             var btnBrowse = new Button { Text = "Огляд...", Left = 360, Top = 34, Width = 90 };
-            btnBrowse.Click += (s, e) =>
-            {
-                using (var fbd = new FolderBrowserDialog { SelectedPath = SafeDir(txtRoot.Text) })
-                {
-                    if (fbd.ShowDialog(this) == DialogResult.OK) txtRoot.Text = fbd.SelectedPath;
-                }
-            };
+            btnBrowse.Click += (s, e) => BrowseInto(txtRoot);
 
-            var lblDefaultPwd = new Label
+            var lblDefaults = new Label
             {
-                Text = "Пароль за замовчуванням (використовується, якщо для конкретного підключення власний пароль не збережено):",
+                Text = "Облікові дані за замовчуванням (якщо немає облікових даних Windows і пароля підключення чи папки):",
                 Left = 12,
                 Top = 72,
                 Width = 440,
-                Height = 32
+                Height = 34
             };
-            txtDefaultPassword = new TextBox { Left = 12, Top = 106, Width = 340, UseSystemPasswordChar = true };
-            chkShowDefaultPassword = new CheckBox { Text = "Показати", Left = 360, Top = 108, Width = 90 };
-            chkShowDefaultPassword.CheckedChanged += (s, e) => txtDefaultPassword.UseSystemPasswordChar = !chkShowDefaultPassword.Checked;
-
-            chkClearDefaultPassword = new CheckBox
-            {
-                Text = "Прибрати пароль за замовчуванням",
-                Left = 12,
-                Top = 134,
-                Width = 300,
-                Enabled = !string.IsNullOrEmpty(working.DefaultEncryptedPassword)
-            };
-
-            var lblHint = new Label
+            lvDefaults = new ListView
             {
                 Left = 12,
-                Top = 160,
-                Width = 440,
-                Height = 32,
-                ForeColor = SystemColors.GrayText,
-                Text = "Залиште поле порожнім, щоб не змінювати вже збережений пароль за замовчуванням."
+                Top = 108,
+                Width = 340,
+                Height = 104,
+                View = View.Details,
+                FullRowSelect = true,
+                HideSelection = false,
+                MultiSelect = false,
+                HeaderStyle = ColumnHeaderStyle.Nonclickable
             };
+            lvDefaults.Columns.Add("Користувач", 210);
+            lvDefaults.Columns.Add("Пароль", 110);
+            lvDefaults.DoubleClick += (s, e) => EditDefault();
+            FillDefaults();
 
-            var lblHotkey = new Label { Text = "Гаряча клавіша (відкриває вікно пошуку з будь-якого місця):", Left = 12, Top = 198, Width = 440 };
+            var btnAddDefault = new Button { Text = "Додати...", Left = 360, Top = 106, Width = 90 };
+            btnAddDefault.Click += (s, e) => AddDefault();
+            var btnEditDefault = new Button { Text = "Змінити...", Left = 360, Top = 140, Width = 90 };
+            btnEditDefault.Click += (s, e) => EditDefault();
+            var btnDelDefault = new Button { Text = "Видалити", Left = 360, Top = 174, Width = 90 };
+            btnDelDefault.Click += (s, e) =>
+            {
+                if (lvDefaults.SelectedIndices.Count == 0) return;
+                working.DefaultCredentials.RemoveAt(lvDefaults.SelectedIndices[0]);
+                FillDefaults();
+            };
+            var lblDefaultsHint = Hint(12, 216, 34,
+                "Підставляється, коли користувач у .rdp збігається (\"admin\" підходить і до \"SERVER\\admin\"); порожній користувач -- для будь-якого.");
 
+            var lblHotkey = new Label { Text = "Гаряча клавіша (відкриває вікно пошуку з будь-якого місця):", Left = 12, Top = 260, Width = 440 };
             txtHotkey = new TextBox
             {
                 Left = 12,
-                Top = 220,
+                Top = 282,
                 Width = 250,
                 ReadOnly = true,
                 Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk)
             };
             txtHotkey.KeyDown += TxtHotkey_KeyDown;
 
-            var btnResetHotkey = new Button { Text = "Типова", Left = 268, Top = 218, Width = 80 };
+            var btnResetHotkey = new Button { Text = "Типова", Left = 268, Top = 280, Width = 80 };
             btnResetHotkey.Click += (s, e) =>
             {
                 capturedHotkeyModifiers = HotkeyUtil.MOD_CONTROL | HotkeyUtil.MOD_ALT;
@@ -2761,28 +3570,19 @@ namespace RdpConsole
                 txtHotkey.Text = HotkeyUtil.Format(capturedHotkeyModifiers, capturedHotkeyVk);
             };
 
-            var btnClearHotkey = new Button { Text = "Вимкнути", Left = 352, Top = 218, Width = 80 };
+            var btnClearHotkey = new Button { Text = "Вимкнути", Left = 352, Top = 280, Width = 80 };
             btnClearHotkey.Click += (s, e) =>
             {
                 capturedHotkeyModifiers = 0;
                 capturedHotkeyVk = 0;
                 txtHotkey.Text = HotkeyUtil.Format(0, 0);
             };
+            var lblHotkeyHint = Hint(12, 312, 34, "Клацніть у поле й натисніть бажану комбінацію (потрібен хоча б один Ctrl/Alt/Shift).");
 
-            var lblHotkeyHint = new Label
-            {
-                Left = 12,
-                Top = 250,
-                Width = 440,
-                Height = 32,
-                ForeColor = SystemColors.GrayText,
-                Text = "Клацніть у поле й натисніть бажану комбінацію (потрібен хоча б один Ctrl/Alt/Shift)."
-            };
-
-            var lblTheme = new Label { Text = "Тема оформлення:", Left = 12, Top = 290, Width = 440 };
-            radioThemeLight = new RadioButton { Text = "Світла", Left = 12, Top = 312, Width = 100 };
-            radioThemeDark = new RadioButton { Text = "Темна", Left = 120, Top = 312, Width = 100 };
-            radioThemeBlue = new RadioButton { Text = "Синя", Left = 228, Top = 312, Width = 100 };
+            var lblTheme = new Label { Text = "Тема оформлення:", Left = 12, Top = 352, Width = 440 };
+            radioThemeLight = new RadioButton { Text = "Світла", Left = 12, Top = 374, Width = 100 };
+            radioThemeDark = new RadioButton { Text = "Темна", Left = 120, Top = 374, Width = 100 };
+            radioThemeBlue = new RadioButton { Text = "Синя", Left = 228, Top = 374, Width = 100 };
             if (working.Theme == ThemeManager.DarkThemeName) radioThemeDark.Checked = true;
             else if (working.Theme == ThemeManager.BlueThemeName) radioThemeBlue.Checked = true;
             else radioThemeLight.Checked = true;
@@ -2795,26 +3595,42 @@ namespace RdpConsole
             {
                 Text = "Прозорий фон Mica (Windows 11, версія 22H2+)",
                 Left = 12,
-                Top = 342,
+                Top = 404,
                 Width = 440,
                 Checked = working.MicaEnabled
             };
+            var lblMicaHint = Hint(12, 426, 34,
+                "Розмитий фон верхньої панелі й статус-рядка. На старіших версіях Windows пункт просто не матиме ефекту.");
 
-            var lblMicaHint = new Label
+            // ---- Права колонка: папка налаштувань, облікові дані Windows, автозапуск, попередження RDP ----
+            var lblSettingsFolder = new Label { Text = "Папка для збереження налаштувань і паролів:", Left = RightCol, Top = 14, Width = 440 };
+            txtSettingsFolder = new TextBox { Left = RightCol, Top = 36, Width = 250, Text = working.SettingsFolder };
+            var btnBrowseSettings = new Button { Text = "Огляд...", Left = RightCol + 258, Top = 34, Width = 90 };
+            btnBrowseSettings.Click += (s, e) => BrowseInto(txtSettingsFolder);
+            var btnDefaultSettings = new Button { Text = "Типова", Left = RightCol + 352, Top = 34, Width = 88 };
+            btnDefaultSettings.Click += (s, e) => txtSettingsFolder.Text = "";
+            var lblSettingsHint = Hint(RightCol, 64, 66,
+                "Наприклад, папка на Google Drive -- тоді паролі й налаштування доступні на всіх ваших ПК. " +
+                "Файл RdpConsole.dat зашифровано, прочитати його може лише RDP Console. " +
+                "Порожньо -- " + SettingsManager.LocalDir + ".");
+
+            chkStoreInWindows = new CheckBox
             {
-                Left = 12,
-                Top = 364,
+                Text = "Під час підключення записувати пароль в облікові дані Windows",
+                Left = RightCol,
+                Top = 138,
                 Width = 440,
-                Height = 32,
-                ForeColor = SystemColors.GrayText,
-                Text = "Розмитий фон верхньої панелі й статус-рядка. На старіших версіях Windows пункт просто не матиме ефекту."
+                Checked = working.StoreInWindowsCredentials
             };
+            var lblStoreHint = Hint(RightCol, 160, 50,
+                "Пароль із застосунку зберігається в Диспетчері облікових даних (TERMSRV/<адреса>) замість тимчасового файлу; " +
+                "далі підключення позначене W. Потрібен користувач у .rdp.");
 
             chkAutostart = new CheckBox
             {
                 Text = "Запускати разом із Windows (згорнутим у трей)",
-                Left = 12,
-                Top = 404,
+                Left = RightCol,
+                Top = 220,
                 Width = 440,
                 Checked = AutostartManager.IsEnabled()
             };
@@ -2822,61 +3638,83 @@ namespace RdpConsole
             var lblRdpWarning = new Label
             {
                 Text = "Попередження \"Невідоме віддалене підключення\" (оновлення Windows, квітень 2026):",
-                Left = 12,
-                Top = 440,
+                Left = RightCol,
+                Top = 260,
                 Width = 440,
-                Height = 32
+                Height = 34
             };
-            lblRdpWarningState = new Label { Left = 12, Top = 478, Width = 300, Height = 20 };
-            btnRdpWarning = new Button { Left = 320, Top = 474, Width = 132 };
+            lblRdpWarningState = new Label { Left = RightCol, Top = 298, Width = 300, Height = 20 };
+            btnRdpWarning = new Button { Left = RightCol + 308, Top = 294, Width = 132 };
             btnRdpWarning.Click += (s, e) => ToggleRdpWarning();
-            var lblRdpWarningHint = new Label
-            {
-                Left = 12,
-                Top = 504,
-                Width = 440,
-                Height = 48,
-                ForeColor = SystemColors.GrayText,
-                Text = "Параметр RedirectionWarningDialogVersion = 1 повертає попередню поведінку mstsc. " +
-                       "Застосовується до всіх користувачів ПК, потрібні права адміністратора."
-            };
+            var lblRdpWarningHint = Hint(RightCol, 324, 50,
+                "Параметр RedirectionWarningDialogVersion = 1 повертає попередню поведінку mstsc. " +
+                "Застосовується до всіх користувачів ПК, потрібні права адміністратора.");
             UpdateRdpWarningState();
 
-            var btnOk = new Button { Text = "OK", Left = 280, Top = 586, Width = 85 };
+            var btnOk = new Button { Text = "OK", Left = 740, Top = 488, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 586, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 832, Top = 488, Width = 85, DialogResult = DialogResult.Cancel };
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
 
-            Controls.Add(lblRoot);
-            Controls.Add(txtRoot);
-            Controls.Add(btnBrowse);
-            Controls.Add(lblDefaultPwd);
-            Controls.Add(txtDefaultPassword);
-            Controls.Add(chkShowDefaultPassword);
-            Controls.Add(chkClearDefaultPassword);
-            Controls.Add(lblHint);
-            Controls.Add(lblHotkey);
-            Controls.Add(txtHotkey);
-            Controls.Add(btnResetHotkey);
-            Controls.Add(btnClearHotkey);
-            Controls.Add(lblHotkeyHint);
-            Controls.Add(lblTheme);
-            Controls.Add(radioThemeLight);
-            Controls.Add(radioThemeDark);
-            Controls.Add(radioThemeBlue);
-            Controls.Add(chkMica);
-            Controls.Add(lblMicaHint);
-            Controls.Add(chkAutostart);
-            Controls.Add(lblRdpWarning);
-            Controls.Add(lblRdpWarningState);
-            Controls.Add(btnRdpWarning);
-            Controls.Add(lblRdpWarningHint);
-            Controls.Add(btnOk);
-            Controls.Add(btnCancel);
+            Controls.AddRange(new Control[]
+            {
+                lblRoot, txtRoot, btnBrowse,
+                lblDefaults, lvDefaults, btnAddDefault, btnEditDefault, btnDelDefault, lblDefaultsHint,
+                lblHotkey, txtHotkey, btnResetHotkey, btnClearHotkey, lblHotkeyHint,
+                lblTheme, radioThemeLight, radioThemeDark, radioThemeBlue, chkMica, lblMicaHint,
+                lblSettingsFolder, txtSettingsFolder, btnBrowseSettings, btnDefaultSettings, lblSettingsHint,
+                chkStoreInWindows, lblStoreHint, chkAutostart,
+                lblRdpWarning, lblRdpWarningState, btnRdpWarning, lblRdpWarningHint,
+                btnOk, btnCancel
+            });
 
             ThemeManager.Apply(this, working.Theme);
+        }
+
+        void BrowseInto(TextBox target)
+        {
+            using (var fbd = new FolderBrowserDialog { SelectedPath = SafeDir(target.Text) })
+            {
+                if (fbd.ShowDialog(this) == DialogResult.OK) target.Text = fbd.SelectedPath;
+            }
+        }
+
+        void FillDefaults()
+        {
+            lvDefaults.BeginUpdate();
+            lvDefaults.Items.Clear();
+            foreach (var d in working.DefaultCredentials)
+            {
+                var item = new ListViewItem(string.IsNullOrWhiteSpace(d.User) ? "(будь-який)" : d.User);
+                item.SubItems.Add("••••••••");
+                lvDefaults.Items.Add(item);
+            }
+            lvDefaults.EndUpdate();
+        }
+
+        void AddDefault()
+        {
+            using (var dlg = new PasswordDialog("Облікові дані за замовчуванням", SelectedThemeName(), true))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                working.DefaultCredentials.Add(new DefaultCredential { User = dlg.User, Password = dlg.Password });
+                FillDefaults();
+            }
+        }
+
+        void EditDefault()
+        {
+            if (lvDefaults.SelectedIndices.Count == 0) return;
+            var d = working.DefaultCredentials[lvDefaults.SelectedIndices[0]];
+            using (var dlg = new PasswordDialog("Облікові дані за замовчуванням", SelectedThemeName(), true, d.User, d.Password))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                d.User = dlg.User;
+                d.Password = dlg.Password;
+                FillDefaults();
+            }
         }
 
         void UpdateRdpWarningState()
@@ -2951,25 +3789,26 @@ namespace RdpConsole
             var root = txtRoot.Text.Trim();
             if (root.Length > 0 && !Directory.Exists(root))
             {
-                var r = MessageBox.Show(this, "Вказана папка не існує. Зберегти все одно?", "Перевірка",
+                var r = MessageBox.Show(this, "Вказана папка з файлами *.rdp не існує. Зберегти все одно?", "Перевірка",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 if (r != DialogResult.Yes) return;
             }
 
-            if (chkClearDefaultPassword.Checked)
+            var settingsFolder = txtSettingsFolder.Text.Trim();
+            if (settingsFolder.Length > 0 && !Directory.Exists(settingsFolder))
             {
-                working.DefaultEncryptedPassword = null;
-            }
-            else if (!string.IsNullOrEmpty(txtDefaultPassword.Text))
-            {
-                working.DefaultEncryptedPassword = PasswordManager.Encrypt(txtDefaultPassword.Text);
+                MessageBox.Show(this, "Вказана папка для збереження налаштувань не існує.", "Перевірка",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
 
             working.RootFolder = root;
+            working.SettingsFolder = settingsFolder;
             working.HotkeyModifiers = capturedHotkeyModifiers;
             working.HotkeyKey = capturedHotkeyVk;
             working.Theme = SelectedThemeName();
             working.MicaEnabled = chkMica.Checked;
+            working.StoreInWindowsCredentials = chkStoreInWindows.Checked;
 
             if (chkAutostart.Checked != AutostartManager.IsEnabled())
             {
@@ -2989,7 +3828,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.5.0";
+        public const string AppVersion = "1.6.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
