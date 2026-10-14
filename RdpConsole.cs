@@ -794,6 +794,113 @@ namespace RdpConsole
         }
     }
 
+    // Автозапуск разом із Windows -- через HKCU\...\Run (без прав адміністратора).
+    // Джерело правди -- сам реєстр, а не settings.json: так стан чекбокса завжди
+    // відповідає тому, що Windows реально запускатиме. Запуск іде з ключем
+    // /minimized -- застосунок стартує одразу в треї, без головного вікна.
+    public static class AutostartManager
+    {
+        const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string ValueName = "RdpConsole";
+        public const string MinimizedArg = "/minimized";
+
+        static string CommandLine
+        {
+            get { return "\"" + Application.ExecutablePath + "\" " + MinimizedArg; }
+        }
+
+        public static bool IsEnabled()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath))
+                {
+                    return key != null && key.GetValue(ValueName) != null;
+                }
+            }
+            catch { return false; }
+        }
+
+        public static void SetEnabled(bool enabled)
+        {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKeyPath))
+            {
+                if (enabled) key.SetValue(ValueName, CommandLine);
+                else if (key.GetValue(ValueName) != null) key.DeleteValue(ValueName);
+            }
+        }
+
+        // Якщо exe перенесли в іншу папку, запис у Run вказував би на старий шлях --
+        // оновлюємо його при кожному запуску (лише коли автозапуск увімкнено).
+        public static void RefreshPathIfEnabled()
+        {
+            try
+            {
+                if (!IsEnabled()) return;
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                {
+                    if (key != null && !string.Equals(key.GetValue(ValueName) as string, CommandLine, StringComparison.OrdinalIgnoreCase))
+                        key.SetValue(ValueName, CommandLine);
+                }
+            }
+            catch { }
+        }
+    }
+
+    // Нове вікно попередження mstsc ("Увага: невідоме віддалене підключення", з усіма
+    // перенаправленнями вимкненими за замовчуванням) з'явилось у квітневому оновленні
+    // Windows 2026 (CVE-2026-26151) і показується при кожному відкритті непідписаного
+    // .rdp. Microsoft документує тимчасовий відкат до попередньої поведінки через
+    // політику RedirectionWarningDialogVersion = 1 у HKLM -- запис туди потребує прав
+    // адміністратора, тому сам запис робимо через reg.exe з підвищенням (UAC).
+    public static class RdpWarningPolicy
+    {
+        const string KeyPath = @"Software\Policies\Microsoft\Windows NT\Terminal Services\Client";
+        const string ValueName = "RedirectionWarningDialogVersion";
+
+        public static bool IsLegacyDialogEnabled()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(KeyPath))
+                {
+                    var v = key != null ? key.GetValue(ValueName) : null;
+                    return v is int && (int)v == 1;
+                }
+            }
+            catch { return false; }
+        }
+
+        // true -- прописати значення 1, false -- видалити значення (повернути нове вікно).
+        // Повертає false, якщо користувач відмовився в UAC або reg.exe завершився з помилкою.
+        public static bool SetLegacyDialog(bool enable)
+        {
+            var regKey = "\"HKLM\\" + KeyPath + "\"";
+            var args = enable
+                ? "add " + regKey + " /v " + ValueName + " /t REG_DWORD /d 1 /f"
+                : "delete " + regKey + " /v " + ValueName + " /f";
+
+            var psi = new ProcessStartInfo("reg.exe", args)
+            {
+                UseShellExecute = true,
+                Verb = "runas",
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+            try
+            {
+                using (var proc = Process.Start(psi))
+                {
+                    proc.WaitForExit();
+                    return proc.ExitCode == 0;
+                }
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return false; // користувач натиснув "Ні" у вікні UAC
+            }
+        }
+    }
+
     public static class Launcher
     {
         // Ці параметри відповідають чекбоксам у діалозі підтвердження RDP-з'єднання
@@ -1037,6 +1144,8 @@ namespace RdpConsole
         NotifyIcon trayIcon;
         bool reallyExit;
         bool trayHintShown;
+        bool startHidden;
+        bool loaded;
 
         // Глобальна гаряча клавіша (за замовчуванням Ctrl+Alt+R, змінюється в
         // Налаштуваннях) -- відкриває вікно швидкого пошуку з будь-якого місця в
@@ -1072,8 +1181,10 @@ namespace RdpConsole
             keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
 
-        public MainForm()
+        public MainForm(bool startHidden = false)
         {
+            this.startHidden = startHidden;
+
             // Форма побудована вручну (без дизайнера), координати -- у реальних пікселях;
             // вимикаємо автомасштабування WinForms, щоб уникнути артефактів промальовування
             // (обрізані рамки, елементи керування за межами вікна) при нестандартному DPI.
@@ -1423,8 +1534,28 @@ namespace RdpConsole
             get { return searchShowingPlaceholder ? "" : txtSearch.Text; }
         }
 
+        // Старт згорнутим у трей (/minimized, автозапуск): Application.Run показує форму,
+        // тож перший показ перехоплюємо тут. Handle створюємо явно -- він потрібен для
+        // RegisterHotKey і прийому WM_SHOWME, а подія Load без показу вікна не настане,
+        // тому ініціалізацію викликаємо вручну (повторно вона не виконається, див. loaded).
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startHidden && value)
+            {
+                startHidden = false;
+                if (!IsHandleCreated) CreateHandle();
+                base.SetVisibleCore(false);
+                MainForm_Load(this, EventArgs.Empty);
+                return;
+            }
+            base.SetVisibleCore(value);
+        }
+
         void MainForm_Load(object sender, EventArgs e)
         {
+            if (loaded) return;
+            loaded = true;
+            AutostartManager.RefreshPathIfEnabled();
             EnsureRootFolder();
             RescanAndFill();
             RegisterGlobalHotkey();
@@ -2523,6 +2654,9 @@ namespace RdpConsole
         RadioButton radioThemeDark;
         RadioButton radioThemeBlue;
         CheckBox chkMica;
+        CheckBox chkAutostart;
+        Label lblRdpWarningState;
+        Button btnRdpWarning;
 
         public SettingsForm(AppSettings current)
         {
@@ -2535,7 +2669,7 @@ namespace RdpConsole
             MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
             Width = 480;
-            Height = 520;
+            Height = 670;
             Font = new Font("Segoe UI", 9.5f);
 
             capturedHotkeyModifiers = working.HotkeyModifiers;
@@ -2676,9 +2810,41 @@ namespace RdpConsole
                 Text = "Розмитий фон верхньої панелі й статус-рядка. На старіших версіях Windows пункт просто не матиме ефекту."
             };
 
-            var btnOk = new Button { Text = "OK", Left = 280, Top = 436, Width = 85 };
+            chkAutostart = new CheckBox
+            {
+                Text = "Запускати разом із Windows (згорнутим у трей)",
+                Left = 12,
+                Top = 404,
+                Width = 440,
+                Checked = AutostartManager.IsEnabled()
+            };
+
+            var lblRdpWarning = new Label
+            {
+                Text = "Попередження \"Невідоме віддалене підключення\" (оновлення Windows, квітень 2026):",
+                Left = 12,
+                Top = 440,
+                Width = 440,
+                Height = 32
+            };
+            lblRdpWarningState = new Label { Left = 12, Top = 478, Width = 300, Height = 20 };
+            btnRdpWarning = new Button { Left = 320, Top = 474, Width = 132 };
+            btnRdpWarning.Click += (s, e) => ToggleRdpWarning();
+            var lblRdpWarningHint = new Label
+            {
+                Left = 12,
+                Top = 504,
+                Width = 440,
+                Height = 48,
+                ForeColor = SystemColors.GrayText,
+                Text = "Параметр RedirectionWarningDialogVersion = 1 повертає попередню поведінку mstsc. " +
+                       "Застосовується до всіх користувачів ПК, потрібні права адміністратора."
+            };
+            UpdateRdpWarningState();
+
+            var btnOk = new Button { Text = "OK", Left = 280, Top = 586, Width = 85 };
             btnOk.Click += (s, e) => Accept();
-            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 436, Width = 85, DialogResult = DialogResult.Cancel };
+            var btnCancel = new Button { Text = "Скасувати", Left = 372, Top = 586, Width = 85, DialogResult = DialogResult.Cancel };
 
             AcceptButton = btnOk;
             CancelButton = btnCancel;
@@ -2702,10 +2868,37 @@ namespace RdpConsole
             Controls.Add(radioThemeBlue);
             Controls.Add(chkMica);
             Controls.Add(lblMicaHint);
+            Controls.Add(chkAutostart);
+            Controls.Add(lblRdpWarning);
+            Controls.Add(lblRdpWarningState);
+            Controls.Add(btnRdpWarning);
+            Controls.Add(lblRdpWarningHint);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
 
             ThemeManager.Apply(this, working.Theme);
+        }
+
+        void UpdateRdpWarningState()
+        {
+            bool legacy = RdpWarningPolicy.IsLegacyDialogEnabled();
+            lblRdpWarningState.Text = legacy
+                ? "Стан: вимкнено (параметр прописано)"
+                : "Стан: показується (параметр не прописано)";
+            btnRdpWarning.Text = legacy ? "Прибрати" : "Прописати";
+        }
+
+        // Діє одразу (як і запит UAC), а не після OK -- це системний параметр, а не
+        // налаштування застосунку, тож "Скасувати" його не відкочує.
+        void ToggleRdpWarning()
+        {
+            bool enable = !RdpWarningPolicy.IsLegacyDialogEnabled();
+            if (!RdpWarningPolicy.SetLegacyDialog(enable))
+            {
+                MessageBox.Show(this, "Не вдалося змінити параметр (потрібні права адміністратора).",
+                    "Налаштування", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            UpdateRdpWarningState();
         }
 
         string SelectedThemeName()
@@ -2777,6 +2970,17 @@ namespace RdpConsole
             working.HotkeyKey = capturedHotkeyVk;
             working.Theme = SelectedThemeName();
             working.MicaEnabled = chkMica.Checked;
+
+            if (chkAutostart.Checked != AutostartManager.IsEnabled())
+            {
+                try { AutostartManager.SetEnabled(chkAutostart.Checked); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Не вдалося змінити автозапуск:\n" + ex.Message, "Налаштування",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+
             ResultSettings = working;
             DialogResult = DialogResult.OK;
             Close();
@@ -2785,7 +2989,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.4.0";
+        public const string AppVersion = "1.5.0";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
@@ -2802,7 +3006,7 @@ namespace RdpConsole
         static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
         [STAThread]
-        public static void Main()
+        public static void Main(string[] args)
         {
             bool createdNew;
             using (var mutex = new Mutex(true, MutexName, out createdNew))
@@ -2822,7 +3026,8 @@ namespace RdpConsole
                     MessageBox.Show("Неочікувана помилка:\n" + e.Exception.Message, "RDP Console",
                         MessageBoxButtons.OK, MessageBoxIcon.Error);
 
-                Application.Run(new MainForm());
+                bool startMinimized = args.Any(a => string.Equals(a, AutostartManager.MinimizedArg, StringComparison.OrdinalIgnoreCase));
+                Application.Run(new MainForm(startMinimized));
                 GC.KeepAlive(mutex);
             }
         }
