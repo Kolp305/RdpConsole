@@ -1955,23 +1955,45 @@ namespace RdpConsole
 
         // Windows забороняє фоновим процесам самовільно забирати фокус (SetForegroundWindow
         // мовчки не спрацьовує), тому вікно, відкрите по глобальній гарячій клавіші, могло
-        // з'являтися без фокуса -- і миттєво закриватися через Deactivate. Стандартний обхід:
-        // імітувати натискання Alt перед SetForegroundWindow -- Windows знімає обмеження,
-        // якщо останньою дією користувача була системна клавіша.
+        // з'являтися без фокуса -- і миттєво закриватися через Deactivate. Обхід: на час
+        // активації приєднуємо свій потік введення до потоку поточного активного вікна
+        // (AttachThreadInput) -- тоді SetForegroundWindow дозволено.
+        // Раніше тут імітувалося натискання Alt, але "відпускання" Alt приходило вже в
+        // наше вікно й вмикало режим меню вікна -- перша набрана буква пошуку губилась.
         [DllImport("user32.dll")]
         static extern bool SetForegroundWindow(IntPtr hWnd);
 
         [DllImport("user32.dll")]
-        static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        static extern IntPtr GetForegroundWindow();
 
-        const byte VK_MENU = 0x12;
-        const uint KEYEVENTF_KEYUP = 0x0002;
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processId);
+
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+        [DllImport("user32.dll")]
+        static extern bool BringWindowToTop(IntPtr hWnd);
 
         static void ForceForegroundWindow(IntPtr hWnd)
         {
-            keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
-            SetForegroundWindow(hWnd);
-            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            var foreground = GetForegroundWindow();
+            uint foregroundThread = foreground != IntPtr.Zero ? GetWindowThreadProcessId(foreground, IntPtr.Zero) : 0;
+            uint currentThread = GetCurrentThreadId();
+            bool attached = foregroundThread != 0 && foregroundThread != currentThread &&
+                            AttachThreadInput(currentThread, foregroundThread, true);
+            try
+            {
+                BringWindowToTop(hWnd);
+                SetForegroundWindow(hWnd);
+            }
+            finally
+            {
+                if (attached) AttachThreadInput(currentThread, foregroundThread, false);
+            }
         }
 
         public MainForm(bool startHidden = false)
@@ -2041,6 +2063,7 @@ namespace RdpConsole
             form.Show();
             ForceForegroundWindow(form.Handle);
             form.Activate();
+            form.FocusSearchBox();
         }
 
         void ShowMainWindow()
@@ -3241,6 +3264,13 @@ namespace RdpConsole
             }
         }
 
+        // Після активації вікна з трея / по гарячій клавіші -- одразу друкувати в пошук.
+        public void FocusSearchBox()
+        {
+            txtSearch.Focus();
+            txtSearch.SelectionStart = txtSearch.TextLength;
+        }
+
         RdpEntry SelectedEntry()
         {
             return treeResults.Visible
@@ -3902,7 +3932,7 @@ namespace RdpConsole
 
     public static class Program
     {
-        public const string AppVersion = "1.7.0";
+        public const string AppVersion = "1.7.1";
         public const string RepoUrl = "https://github.com/Kolp305/RdpConsole";
 
         // Унікальне для цього застосунку зареєстроване Windows-повідомлення: перший
